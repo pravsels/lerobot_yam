@@ -1,0 +1,4 @@
+-e ./yam_common
+-e ./lerobot_robot_yam
+-e ./lerobot_teleoperator_yam_gello
+

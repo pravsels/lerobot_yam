@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_teleoperator_yam_gello"
+version = "0.1.1"
+description = "YAM leader teleoperator plugin for LeRobot"
+readme = "README.md"
+authors = [
+  { name = "Praveen Selvaraj" },
+]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "yam-common",
+  "lerobot>=0.4.3",
+  "dynamixel-sdk",
+]
+
+[project.urls]
+homepage = "https://github.com/pravsels/lerobot_yam"
+source = "https://github.com/pravsels/lerobot_yam"
+issues = "https://github.com/pravsels/lerobot_yam/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["lerobot_teleoperator_yam_gello*"]
+

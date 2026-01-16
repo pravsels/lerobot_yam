@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yam-common"
+version = "0.1.1"
+description = "Shared utilities for YAM arm LeRobot plugins"
+readme = "README.md"
+authors = [
+  { name = "Praveen Selvaraj" },
+]
+license = { text = "MIT" }
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+dependencies = [
+  "numpy",
+  "mujoco",
+  "lerobot>=0.4.3",
+  "python-can",
+]
+
+[project.urls]
+homepage = "https://github.com/pravsels/lerobot_yam"
+source = "https://github.com/pravsels/lerobot_yam"
+issues = "https://github.com/pravsels/lerobot_yam/issues"
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["yam_common*"]
+
