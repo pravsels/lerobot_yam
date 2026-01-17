@@ -1,6 +1,7 @@
 """YAM follower with i2rt-authentic motor-chain behavior."""
 
 import logging
+import sys
 import time
 from functools import cached_property
 from typing import Optional
@@ -209,6 +210,7 @@ class YAMFollower(Robot):
         if self._motor_chain_robot is None:
             return
         self._enter_zero_torque_mode_safely(reason="close", exc=None)
+        self._hold_zero_gravity_before_shutdown()
         self._motor_chain_robot.close()
         self._motor_chain_robot = None
         for cam in self.cameras.values():
@@ -232,6 +234,7 @@ class YAMFollower(Robot):
 
         if self._motor_chain_robot is not None:
             self._enter_zero_torque_mode_safely(reason="disconnect", exc=None)
+            self._hold_zero_gravity_before_shutdown()
             self._motor_chain_robot.close()
             self._motor_chain_robot = None
 
@@ -290,6 +293,26 @@ class YAMFollower(Robot):
             logger.warning(
                 "Zero-torque mode active. Move the arm to a safe rest position before exit."
             )
+
+    def _hold_zero_gravity_before_shutdown(self) -> None:
+        """Hold zero-gravity mode before shutting down the bus."""
+        if self._motor_chain_robot is None:
+            return
+        if bool(getattr(self.config, "shutdown_zero_gravity_wait_for_enter", False)):
+            if sys.stdin is not None and sys.stdin.isatty():
+                logger.warning(
+                    "Zero-G active. Move to a safe rest position, then press ENTER to finish shutdown."
+                )
+                try:
+                    input()
+                except Exception:
+                    logger.exception("Failed while waiting for ENTER; continuing shutdown.")
+            else:
+                logger.error(
+                    "Zero-G active. No TTY detected; holding indefinitely before shutdown."
+                )
+                while True:
+                    time.sleep(1.0)
 
     def _lerobot_from_i2rt(self, i2rt_joint_pos: np.ndarray) -> np.ndarray:
         """Map i2rt joint positions to LeRobot normalized values."""

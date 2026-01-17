@@ -161,6 +161,9 @@ class YAMFollowerConfig:
     # i2rt behavior: start in zero-gravity mode unless disabled.
     zero_gravity_mode: bool = True
 
+    # Block shutdown until the user presses ENTER (TTY only).
+    shutdown_zero_gravity_wait_for_enter: bool = True
+
     # =========================================================================
     # Gripper Force Limiting
     # Source: i2rt/robots/get_robot.py limit_gripper_force (line 129)
