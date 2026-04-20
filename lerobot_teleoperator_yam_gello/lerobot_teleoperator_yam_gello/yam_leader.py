@@ -6,9 +6,11 @@ using Dynamixel XL330 servos.
 """
 
 import logging
+import math
+import sys
 import time
 
-from lerobot.motors import MotorCalibration
+from lerobot.motors import MotorCalibration, MotorNormMode
 from lerobot.motors.dynamixel import DynamixelMotorsBus, OperatingMode
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
@@ -46,6 +48,10 @@ class YAMLeader(Teleoperator):
             calibration=self.calibration,
         )
         self._is_calibrated_cached = False
+
+        # Range-safety state (Phase 2A)
+        self._out_of_range_joints: set[str] = set()
+        self._last_warn_time: dict[str, float] = {}
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -86,6 +92,10 @@ class YAMLeader(Teleoperator):
             self._is_calibrated_cached = bool(self.calibration)
 
         self.configure()
+
+        if self.config.preflight_range_check:
+            self._preflight_range_check()
+
         logger.info(f"{self} connected.")
 
     def calibrate(self) -> None:
@@ -189,7 +199,14 @@ class YAMLeader(Teleoperator):
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
 
     def get_action(self) -> dict[str, float]:
-        """Read current joint positions from the leader arm."""
+        """Read current joint positions from the leader arm.
+
+        IMPORTANT: We read RAW ticks (not normalized) so we can detect when a
+        joint is actually outside its calibrated [range_min, range_max] window.
+        LeRobot's built-in normalization silently clamps raw ticks to that
+        window, which would mask out-of-range states (the value would just
+        saturate at -100 / +100 instead).
+        """
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
         if not self.is_calibrated:
@@ -199,24 +216,153 @@ class YAMLeader(Teleoperator):
             )
 
         start = time.perf_counter()
+        ticks_by_name = self._read_raw_ticks()
 
-        last_exc = None
-        for _ in range(max(1, self.config.read_retries)):
-            try:
-                positions = self.bus.sync_read("Present_Position", normalize=True)
-                break
-            except Exception as exc:
-                last_exc = exc
-                time.sleep(self.config.read_retry_sleep_s)
-        else:
-            raise last_exc
+        action: dict[str, float] = {}
+        now = time.perf_counter()
+        tol_ticks = self._normalized_tol_to_ticks_default()
 
-        action = {f"{motor}.pos": val for motor, val in positions.items()}
+        for motor, ticks in ticks_by_name.items():
+            in_range = self._is_in_range_raw(motor, ticks, tol_ticks)
+            if in_range:
+                if motor in self._out_of_range_joints:
+                    logger.warning(
+                        "%s back in range (ticks=%d). Resuming teleop for this joint.",
+                        motor, ticks,
+                    )
+                    self._out_of_range_joints.discard(motor)
+                action[f"{motor}.pos"] = self._normalize_ticks(motor, ticks)
+            else:
+                last = self._last_warn_time.get(motor, 0.0)
+                if now - last >= self.config.out_of_range_warn_period_s:
+                    cal = self.calibration[motor]
+                    direction = "DECREASE" if ticks > cal.range_max else "INCREASE"
+                    action_str = (
+                        "Holding follower joint."
+                        if self.config.freeze_out_of_range
+                        else "Sending clamped value."
+                    )
+                    logger.warning(
+                        "%s OUT OF RANGE (ticks=%d, valid=[%d, %d]). %s "
+                        "Rotate to %s ticks.",
+                        motor, ticks, cal.range_min, cal.range_max, action_str, direction,
+                    )
+                    self._last_warn_time[motor] = now
+                self._out_of_range_joints.add(motor)
+                if self.config.freeze_out_of_range:
+                    action[f"{motor}.pos"] = float("nan")
+                else:
+                    action[f"{motor}.pos"] = self._normalize_ticks(motor, ticks)
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action in {dt_ms:.1f}ms")
 
         return action
+
+    # =========================================================================
+    # Range-safety helpers
+    # =========================================================================
+
+    def _read_raw_ticks(self) -> dict[str, int]:
+        """Read raw Present_Position ticks (no clamping/normalization) with retry."""
+        last_exc = None
+        for _ in range(max(1, self.config.read_retries)):
+            try:
+                return self.bus.sync_read("Present_Position", normalize=False)
+            except Exception as exc:
+                last_exc = exc
+                time.sleep(self.config.read_retry_sleep_s)
+        raise last_exc
+
+    def _normalized_tol_to_ticks_default(self) -> int:
+        """Average tick tolerance derived from the configured normalized tolerance.
+
+        We approximate using the smallest joint span so out-of-range detection
+        is conservative. Returns at least 1 tick.
+        """
+        spans = [
+            max(1, self.calibration[m].range_max - self.calibration[m].range_min)
+            for m in self.bus.motors
+        ]
+        smallest = min(spans) if spans else 1
+        norm_tol = max(0.0, float(self.config.out_of_range_tolerance))
+        return max(1, int(round((norm_tol / 200.0) * smallest)))
+
+    def _is_in_range_raw(self, motor_name: str, ticks: int, tol_ticks: int) -> bool:
+        """Check if a raw tick value is within the calibrated [range_min, range_max]."""
+        cal = self.calibration[motor_name]
+        return (cal.range_min - tol_ticks) <= ticks <= (cal.range_max + tol_ticks)
+
+    def _normalize_ticks(self, motor_name: str, ticks: int) -> float:
+        """Replicate lerobot _normalize() formula manually for a single motor.
+
+        Used so out-of-range joints can be returned as NaN instead of being
+        silently clamped to the limits.
+        """
+        cal = self.calibration[motor_name]
+        motor = self.bus.motors[motor_name]
+        lo, hi = cal.range_min, cal.range_max
+        if hi == lo:
+            return 0.0
+        bounded = min(hi, max(lo, ticks))
+        if motor.norm_mode == MotorNormMode.RANGE_M100_100:
+            norm = (((bounded - lo) / (hi - lo)) * 200.0) - 100.0
+            return -norm if cal.drive_mode else norm
+        if motor.norm_mode == MotorNormMode.RANGE_0_100:
+            norm = ((bounded - lo) / (hi - lo)) * 100.0
+            return 100.0 - norm if cal.drive_mode else norm
+        return float(ticks)
+
+    def _preflight_range_check(self) -> None:
+        """
+        Phase 1: block until every leader joint is within its valid range.
+
+        The user may have moved the GELLO arm while the program was off, so on
+        connect we verify each joint and prod the user to rotate any offending
+        joint back into range before teleop begins.
+
+        This works on RAW ticks, since LeRobot's normalize() silently clamps
+        out-of-range positions to the calibration window.
+        """
+        hz = max(1.0, float(self.config.preflight_refresh_hz))
+        period = 1.0 / hz
+        tol_ticks = self._normalized_tol_to_ticks_default()
+
+        print(
+            "Preflight: checking GELLO joint ranges. Rotate any flagged joint until in range.",
+            flush=True,
+        )
+        printed_status = False
+        try:
+            while True:
+                ticks_by_name = self._read_raw_ticks()
+                out = []
+                for name, ticks in ticks_by_name.items():
+                    if not self._is_in_range_raw(name, ticks, tol_ticks):
+                        out.append((name, ticks))
+
+                if not out:
+                    if printed_status:
+                        sys.stdout.write("\r\x1b[2K")
+                        sys.stdout.flush()
+                    print("Preflight: all joints in range. Starting teleop.", flush=True)
+                    return
+
+                parts = []
+                for name, ticks in out:
+                    cal = self.calibration[name]
+                    direction = "DECREASE" if ticks > cal.range_max else "INCREASE"
+                    parts.append(
+                        f"{name} (ticks={ticks}, valid=[{cal.range_min},{cal.range_max}], "
+                        f"rotate to {direction})"
+                    )
+                sys.stdout.write("\r\x1b[2KOut of range: " + " | ".join(parts))
+                sys.stdout.flush()
+                printed_status = True
+                time.sleep(period)
+        except KeyboardInterrupt:
+            print("\nPreflight aborted by user.", flush=True)
+            raise
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
         """Send feedback to teleoperator (no-op for leader)."""
