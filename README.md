@@ -8,14 +8,29 @@ Requirements: CAN interface (e.g. `can0`) and a GELLO leader (port configurable)
 GELLO assembly information from [gello_mechanical](https://github.com/wuphilipp/gello_mechanical/).
 
 ```bash
-pip install -e .
-lerobot-teleoperate \
+uv sync
+uv run lerobot-teleoperate \
   --robot.type=yam_follower \
   --robot.port=can0 \
   --robot.gripper_type=crank_4310 \
   --teleop.type=yam_leader \
   --teleop.port=/dev/ttyUSB0
 ```
+
+Using an existing leader calibration file (for example `yam_lerobot.json` in the
+repo root):
+```bash
+uv run lerobot-teleoperate \
+  --robot.type=yam_follower \
+  --robot.port=can0 \
+  --robot.gripper_type=crank_4310 \
+  --teleop.type=yam_leader \
+  --teleop.port=/dev/ttyUSB0 \
+  --teleop.calibration_dir=./ \
+  --teleop.id=yam_lerobot
+```
+`--teleop.id` is required when loading an existing calibration file, because
+LeRobot resolves calibration as `<teleop.calibration_dir>/<teleop.id>.json`.
 
 Note: this repo expects `lerobot` 0.4.3 features (plugin discovery in the
 standard CLIs). If 0.4.3 is not on PyPI, install it from
@@ -24,7 +39,7 @@ standard CLIs). If 0.4.3 is not on PyPI, install it from
 ## Record
 
 ```bash
-lerobot-record \
+uv run lerobot-record \
   --dataset.repo_id=YOUR_USERNAME/yam_teleop \
   --dataset.single_task="Teleop YAM arm (pick/place)" \
   --dataset.fps=30 \
@@ -42,7 +57,7 @@ lerobot-record \
 ## Policy Control
 
 ```bash
-lerobot-control \
+uv run lerobot-control \
   --robot.type=yam_follower \
   --robot.port=can0 \
   --policy.path=YOUR_USERNAME/yam-policy
@@ -52,12 +67,12 @@ lerobot-control \
 
 List cameras:
 ```bash
-lerobot-find-cameras opencv
+uv run lerobot-find-cameras opencv
 ```
 
 Teleop with cameras + Rerun:
 ```bash
-lerobot-teleoperate \
+uv run lerobot-teleoperate \
   --robot.type=yam_follower \
   --robot.port=can0 \
   --robot.gripper_type=crank_4310 \
