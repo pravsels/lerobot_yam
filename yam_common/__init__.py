@@ -1,3 +1,10 @@
+"""Checkout shim so `import yam_common` from the repo root loads the package."""
+
+from pathlib import Path
+
+_inner = Path(__file__).resolve().parent / "yam_common"
+__path__ = [str(_inner)]
+
 from .mujoco_kdl import MuJoCoKDL, get_yam_mujoco_kdl, packaged_yam_model_dir
 from .motor_chain_robot import MotorChainRobot
 from .utils import GripperForceLimiter, GripperType, JointMapper

@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, List, Optional, Protocol, Tuple
+from typing import Any, Callable, List, Optional, Protocol, Sequence, Tuple
 
 import can
 import numpy as np
@@ -195,6 +195,19 @@ class DMSingleMotorCanInterface(CanInterface):
         logging.getLogger().setLevel(current_level)
         return self.parse_recv_message(message, motor_type)
 
+    def probe_motor(self, motor_id: int, motor_type: str) -> FeedbackFrameInfo:
+        """Read one motor's feedback without sending the motor_on enable frame."""
+        return self.set_control(
+            motor_id,
+            motor_type,
+            pos=0.0,
+            vel=0.0,
+            kp=0.0,
+            kd=0.0,
+            torque=0.0,
+            ignore_error=True,
+        )
+
     def clean_error(self, motor_id: int) -> None:
         data = [0xFF] * 7 + [0xFB]
         message = can.Message(arbitration_id=motor_id, data=data, is_extended_id=False)
@@ -230,6 +243,7 @@ class DMSingleMotorCanInterface(CanInterface):
         kp: float,
         kd: float,
         torque: float,
+        ignore_error: bool = False,
     ) -> FeedbackFrameInfo:
         frame_id = self._get_frame_id(motor_id)
         data = bytearray(8)
@@ -254,7 +268,7 @@ class DMSingleMotorCanInterface(CanInterface):
             data[0:4] = can_data[0:4]
 
         message = self._send_message_get_response(frame_id, motor_id, data, max_retry=15)
-        return self.parse_recv_message(message, motor_type)
+        return self.parse_recv_message(message, motor_type, ignore_error=ignore_error)
 
     def parse_recv_message(
         self, message: can.Message, motor_type: str, ignore_error: bool = False
@@ -342,6 +356,8 @@ class DMChainCanInterface(MotorChain):
         control_mode: ControlMode = ControlMode.MIT,
         get_same_bus_device_driver: Optional[Callable] = None,
         use_buffered_reader: bool = False,
+        enable_motors: bool = True,
+        bustype: str = "socketcan",
     ):
         assert not use_buffered_reader, (
             "buffered reader is not very stable; the latest encoder fix allows us to use the non-buffered reader"
@@ -354,45 +370,53 @@ class DMChainCanInterface(MotorChain):
         self.motor_offset = np.array(motor_offset)
         self.motor_direction = np.array(motor_direction)
         self.channel = channel
-        logging.info(f"Channel: {channel}, Bitrate: {bitrate}")
-        if "can" in channel:
-            self.motor_interface = DMSingleMotorCanInterface(
-                channel=channel,
-                bustype="socketcan",
-                receive_mode=receive_mode,
-                name=motor_chain_name,
-                control_mode=control_mode,
-                use_buffered_reader=use_buffered_reader,
-            )
-        else:
-            self.motor_interface = DMSingleMotorCanInterface(
-                channel=channel,
-                bitrate=bitrate,
-                name=motor_chain_name,
-                use_buffered_reader=use_buffered_reader,
-            )
+        self.bustype = bustype
+        self._closed = False
+        self._control_thread: Optional[threading.Thread] = None
+        self.running = False
+        self._enabled_motors: List[Tuple[int, str]] = []
+        self.motor_interface = None
         self.state = None
         self.state_lock = threading.Lock()
-
         self.same_bus_device_states = None
         self.same_bus_device_lock = threading.Lock()
-        if get_same_bus_device_driver is not None:
-            self.same_bus_device_driver = get_same_bus_device_driver(self.motor_interface)
-        else:
-            self.same_bus_device_driver = None
-
+        self.same_bus_device_driver = None
         self.absolute_positions = None
-        self._motor_on()
-        starting_command = []
-        for motor_state in self.state:
-            starting_command.append(MotorCmd(torque=motor_state.torque))
-        logging.info(f"Initializing motorchain with starting command: {starting_command}")
-        self.commands = starting_command
+        self.control_loop_error: Optional[BaseException] = None
         self.command_lock = threading.Lock()
-
-        self.start_thread_flag = start_thread
-        if start_thread:
-            self.start_thread()
+        self.commands = [MotorCmd() for _ in self.motor_list]
+        self.start_thread_flag = False
+        logging.info(f"Channel: {channel}, Bitrate: {bitrate}")
+        self.motor_interface = DMSingleMotorCanInterface(
+            channel=channel,
+            bustype=bustype,
+            bitrate=bitrate,
+            receive_mode=receive_mode,
+            name=motor_chain_name,
+            control_mode=control_mode,
+            use_buffered_reader=use_buffered_reader,
+        )
+        try:
+            if get_same_bus_device_driver is not None:
+                self.same_bus_device_driver = get_same_bus_device_driver(self.motor_interface)
+            if enable_motors:
+                self._motor_on()
+                starting_command = []
+                for motor_state in self.state:
+                    starting_command.append(MotorCmd(torque=motor_state.torque))
+                logging.info(f"Initializing motorchain with starting command: {starting_command}")
+                self.commands = starting_command
+                self.start_thread_flag = start_thread
+                if start_thread:
+                    self.start_thread()
+            else:
+                self.state = None
+                self.running = False
+                self.commands = [MotorCmd() for _ in self.motor_list]
+                self.start_thread_flag = False
+        except Exception:
+            self.close()
+            raise
 
     def __repr__(self) -> str:
         return f"DMChainCanInterface(channel={self.channel})"
@@ -443,6 +467,9 @@ class DMChainCanInterface(MotorChain):
             logging.info(f"Turning on motor_id: {motor_id}, motor_type: {motor_type}")
             time.sleep(0.003)
             motor_feedback.append(self.motor_interface.motor_on(motor_id, motor_type))
+            enabled = (motor_id, motor_type)
+            if enabled not in self._enabled_motors:
+                self._enabled_motors.append(enabled)
         self._update_absolute_positions(motor_feedback)
         self.state = motor_feedback
         self.running = True
@@ -450,8 +477,12 @@ class DMChainCanInterface(MotorChain):
 
     def start_thread(self) -> None:
         self._motor_on()
-        thread = threading.Thread(target=self._set_torques_and_update_state)
-        thread.start()
+        self._control_thread = threading.Thread(
+            target=self._set_torques_and_update_state,
+            name=f"{self}-control",
+            daemon=False,
+        )
+        self._control_thread.start()
         time.sleep(0.1)
         while self.state is None:
             time.sleep(0.1)
@@ -506,7 +537,8 @@ class DMChainCanInterface(MotorChain):
                     time.sleep(0.0005)
                     rate_recorder.track()
                 except Exception as e:
-                    print(f"DM Error in control loop: {e}")
+                    logging.exception("DM Error in control loop")
+                    self.control_loop_error = e
                     self.running = False
                     raise e
 
@@ -584,8 +616,85 @@ class DMChainCanInterface(MotorChain):
         with self.same_bus_device_lock:
             return self.same_bus_device_states
 
-    def close(self) -> None:
+    def _disable_enabled_motors(self) -> None:
+        """Zero-torque or motor-off IDs that already succeeded motor_on. Not a motion command."""
+        iface = getattr(self, "motor_interface", None)
+        if iface is None:
+            return
+        for motor_id, motor_type in list(getattr(self, "_enabled_motors", [])):
+            try:
+                if hasattr(iface, "motor_off"):
+                    iface.motor_off(motor_id)
+                elif hasattr(iface, "set_control"):
+                    iface.set_control(
+                        motor_id,
+                        motor_type,
+                        pos=0.0,
+                        vel=0.0,
+                        kp=0.0,
+                        kd=0.0,
+                        torque=0.0,
+                        ignore_error=True,
+                    )
+            except Exception:
+                logging.exception("Failed to disable motor %s during close", motor_id)
+        self._enabled_motors = []
+
+    def close(self, disable_motors: bool = True) -> None:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         self.running = False
+        thread = getattr(self, "_control_thread", None)
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=2.0)
+        if disable_motors:
+            try:
+                self._disable_enabled_motors()
+            except Exception:
+                logging.exception("Failed to disable motors during close")
+        iface = getattr(self, "motor_interface", None)
+        if iface is not None:
+            try:
+                iface.close()
+            except Exception:
+                logging.exception("Failed to close motor CAN interface")
+
+
+def probe_motors(
+    channel: str,
+    motor_ids: Sequence[int],
+    *,
+    bitrate: int = 1_000_000,
+    bustype: str = "socketcan",
+    receive_mode: ReceiveMode = ReceiveMode.p16,
+    motor_types: Optional[dict[int, str]] = None,
+) -> List[FeedbackFrameInfo]:
+    """Query expected motor IDs without calling motor_on or starting a control thread."""
+    default_types = {
+        1: "DM4340",
+        2: "DM4340",
+        3: "DM4340",
+        4: "DM4310",
+        5: "DM4310",
+        6: "DM4310",
+        7: "DM4310",
+    }
+    interface = DMSingleMotorCanInterface(
+        channel=channel,
+        bustype=bustype,
+        bitrate=bitrate,
+        receive_mode=receive_mode,
+        name="yam_probe",
+    )
+    try:
+        results = []
+        for motor_id in motor_ids:
+            motor_type = (motor_types or default_types).get(int(motor_id), "DM4310")
+            results.append(interface.probe_motor(int(motor_id), motor_type))
+        return results
+    finally:
+        interface.close()
 
 
 class MultiDMChainCanInterface(MotorChain):

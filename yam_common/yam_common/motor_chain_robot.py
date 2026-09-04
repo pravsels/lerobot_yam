@@ -103,7 +103,7 @@ class MotorChainRobot:
                 "Gripper index should be the last one, but got {gripper_index}"
             )
             if gripper_limits is None and enable_gripper_calibration:
-                from lerobot.robots.yam_follower.utils import detect_gripper_limits
+                from yam_common.utils import detect_gripper_limits
 
                 logger.info("Auto-detecting gripper limits...")
                 detected_limits = detect_gripper_limits(
@@ -170,6 +170,7 @@ class MotorChainRobot:
 
         self._command_lock = threading.Lock()
         self._state_lock = threading.Lock()
+        self.control_loop_error: Optional[BaseException] = None
         self._joint_state: Optional[JointStates] = None
         while self._joint_state is None:
             time.sleep(0.05)
@@ -230,9 +231,10 @@ class MotorChainRobot:
                 elapsed_time = current_time - last_time
                 self.update()
                 if not self.motor_chain.running:
+                    dm_error = getattr(self.motor_chain, "control_loop_error", None)
                     raise RuntimeError(
                         f"{self}: motor_chain_robot's motor chain is not running, exiting the robot server"
-                    )
+                    ) from dm_error
                 time.sleep(0.004)
                 iteration_count += 1
                 if elapsed_time >= 10.0:
@@ -245,13 +247,13 @@ class MotorChainRobot:
                     last_time = current_time
                     iteration_count = 0
         except Exception as exc:
-            logging.error(f"{self}: robot server error, entering zero-torque mode: {exc}")
+            self.control_loop_error = exc
+            logging.exception("%s: robot server error, entering zero-torque mode", self)
             try:
                 self.zero_torque_mode()
             except Exception:
                 pass
             self._stop_event.set()
-            raise
 
     def update(self) -> None:
         with self._command_lock:
@@ -335,6 +337,12 @@ class MotorChainRobot:
         if self._gripper_index is None:
             return t
         return np.append(t, 0.0)
+
+    def raise_if_unhealthy(self) -> None:
+        if self.control_loop_error is not None:
+            raise RuntimeError(f"{self}: control loop is not running") from self.control_loop_error
+        if self._stop_event.is_set() and not self._server_thread.is_alive():
+            raise RuntimeError(f"{self}: control loop is not running")
 
     def num_dofs(self) -> int:
         return len(self.motor_chain)

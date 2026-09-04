@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yam-common"
-version = "0.1.1"
-description = "Shared utilities for YAM arm LeRobot plugins"
+version = "0.2.0"
+description = "Hardware controller and shared utilities for YAM arms"
 readme = "README.md"
 authors = [
   { name = "Praveen Selvaraj" },
@@ -20,7 +20,6 @@ classifiers = [
 dependencies = [
   "numpy",
   "mujoco",
-  "lerobot>=0.4.3",
   "python-can",
 ]
 
@@ -30,7 +29,14 @@ source = "https://github.com/pravsels/lerobot_yam"
 issues = "https://github.com/pravsels/lerobot_yam/issues"
 
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["yam_common*"]
+[tool.setuptools]
+packages = ["yam_common", "yam_common.dm"]
+package-dir = {"yam_common" = "yam_common"}
+
+[tool.setuptools.package-data]
+yam_common = ["robot_models/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
 

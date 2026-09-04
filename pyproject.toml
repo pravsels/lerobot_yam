@@ -33,5 +33,9 @@ issues = "https://github.com/pravsels/lerobot_yam/issues"
 packages = []
 py-modules = []
 
+[tool.pytest.ini_options]
+testpaths = ["yam_common/tests"]
+pythonpath = ["yam_common"]
+
 
 

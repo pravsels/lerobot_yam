@@ -156,6 +156,11 @@ class MuJoCoKDL:
         return self.compute_inverse_dynamics(q, zeros, zeros)
 
 
+def packaged_yam_model_dir() -> str:
+    """Return the packaged YAM MuJoCo model directory shipped with yam_common."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "robot_models", "yam")
+
+
 def get_yam_mujoco_kdl(gripper_type: str = "crank_4310") -> MuJoCoKDL:
     """
     Get MuJoCoKDL instance for YAM robot with appropriate XML model.
@@ -180,20 +185,12 @@ def get_yam_mujoco_kdl(gripper_type: str = "crank_4310") -> MuJoCoKDL:
     if gripper_type not in xml_paths:
         raise ValueError(f"Unknown gripper type: {gripper_type}. Valid types: {list(xml_paths.keys())}")
 
-    # Try to find the XML file in several locations
     xml_filename = xml_paths[gripper_type]
-
-    # Search paths (in order of preference):
-    # 1. i2rt installation (if available)
-    # 2. Local lerobot models directory
-    search_paths = [
-        # i2rt installation
-        os.path.expanduser("~/Desktop/code/i2rt/i2rt/robot_models/yam"),
-        # Relative to this file
-        os.path.join(os.path.dirname(__file__), "robot_models"),
-        # Package data
-        os.path.join(os.path.dirname(__file__), "..", "..", "data", "robot_models", "yam"),
-    ]
+    search_paths = []
+    env_dir = os.environ.get("YAM_MUJOCO_MODEL_DIR")
+    if env_dir:
+        search_paths.append(os.path.expanduser(env_dir))
+    search_paths.append(packaged_yam_model_dir())
 
     for base_path in search_paths:
         xml_path = os.path.join(base_path, xml_filename)

@@ -32,6 +32,9 @@ class CanInterface:
 
     def close(self) -> None:
         """Shut down the CAN bus."""
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
         if self.use_buffered_reader:
             self.notifier.stop()
         self.bus.shutdown()
