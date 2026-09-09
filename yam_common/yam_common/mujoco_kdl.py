@@ -1,5 +1,5 @@
 """
-MuJoCo-based gravity compensation for YAM robot.
+MuJoCo-based kinematics and gravity compensation for YAM robot.
 
 Faithfully ported from i2rt/utils/mujoco_utils.py.
 
@@ -8,6 +8,7 @@ to compensate for gravity at any given joint configuration.
 """
 
 import os
+from collections.abc import Sequence
 from typing import Optional
 
 import numpy as np
@@ -154,6 +155,51 @@ class MuJoCoKDL:
         """
         zeros = np.zeros_like(q)
         return self.compute_inverse_dynamics(q, zeros, zeros)
+
+    def compute_eef_pose(
+        self,
+        q: Sequence[float] | np.ndarray,
+        site_name: str = "tcp_site",
+    ) -> np.ndarray:
+        """Compute an end-effector pose as ``[xyz, rotation_6d]``.
+
+        The rotation uses the first two rows of the end-effector rotation
+        matrix, flattened in row-major order. Coordinates are expressed in the
+        MuJoCo model's base frame.
+
+        Args:
+            q: Exactly ``num_joints`` finite joint positions in radians.
+            site_name: MuJoCo site representing the end effector, typically
+                ``"tcp_site"`` or ``"grasp_site"``.
+
+        Returns:
+            Array of shape ``(9,)`` containing xyz followed by rotation 6D.
+
+        Raises:
+            ValueError: If the joint positions are invalid or the site does not
+                exist in the loaded model.
+        """
+        joint_positions = np.asarray(q, dtype=np.float64).reshape(-1)
+        if joint_positions.size != self.num_joints:
+            raise ValueError(
+                f"q must contain exactly {self.num_joints} joint positions, "
+                f"got {joint_positions.size}"
+            )
+        if not np.isfinite(joint_positions).all():
+            raise ValueError("q joint positions must be finite")
+
+        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, site_name)
+        if site_id == -1:
+            raise ValueError(f"unknown MuJoCo site {site_name!r}")
+
+        self.data.qpos[:] = joint_positions
+        mujoco.mj_forward(self.model, self.data)
+        return np.concatenate(
+            (
+                self.data.site_xpos[site_id],
+                self.data.site_xmat[site_id, :6],
+            )
+        ).copy()
 
 
 def packaged_yam_model_dir() -> str:
