@@ -235,9 +235,22 @@ def prepare_normalized_action(
         max_steps[names.index(GRIPPER_JOINT)] = config.lerobot_gripper_max_step
     delta = prepared_array - current_array
     clamped_delta = np.clip(delta, -max_steps, max_steps)
-    if log_clamp and np.any(np.not_equal(delta, clamped_delta)):
-        logger.warning("LeRobot action step limited for safety.")
     limited = current_array + clamped_delta
+    clipped = np.not_equal(delta, clamped_delta)
+    if log_clamp and np.any(clipped):
+        details = []
+        for index in np.flatnonzero(clipped):
+            name = names[index]
+            details.append(
+                f"{name} requested={float(action[f'{name}.pos']):.6f} "
+                f"current={current_array[index]:.6f} "
+                f"clamped={limited[index]:.6f}"
+            )
+        logger.warning(
+            "LeRobot action step limited for safety: port=%s; %s",
+            config.port,
+            "; ".join(details),
+        )
     return {f"{name}.pos": float(val) for name, val in zip(names, limited)}
 
 

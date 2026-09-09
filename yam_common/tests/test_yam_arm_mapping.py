@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 
@@ -115,3 +117,40 @@ def test_send_action_holds_current_for_missing_or_nonfinite_keys() -> None:
     for key in EXPECTED_KEYS:
         assert performed[key] == pytest.approx(before[key])
     assert len(robot.commands) == 1
+
+
+def test_step_limiter_logs_port_and_all_clipped_joint_values(caplog) -> None:
+    from yam_common import YAMArmConfig, prepare_normalized_action
+
+    config = YAMArmConfig(
+        port="can_yam_right",
+        lerobot_max_step=5.0,
+        lerobot_gripper_max_step=5.0,
+    )
+    current = {key: 0.0 for key in EXPECTED_KEYS}
+    current["gripper.pos"] = 50.0
+    requested = dict(current)
+    requested.update(
+        {
+            "shoulder_pan.pos": 12.345,
+            "shoulder_lift.pos": 3.0,
+            "gripper.pos": 0.0,
+        }
+    )
+
+    with caplog.at_level(logging.WARNING, logger="yam_common.yam_arm"):
+        performed = prepare_normalized_action(
+            requested,
+            current,
+            config,
+            log_clamp=True,
+        )
+
+    assert performed["shoulder_pan.pos"] == pytest.approx(5.0)
+    assert performed["shoulder_lift.pos"] == pytest.approx(3.0)
+    assert performed["gripper.pos"] == pytest.approx(45.0)
+    assert caplog.messages == [
+        "LeRobot action step limited for safety: port=can_yam_right; "
+        "shoulder_pan requested=12.345000 current=0.000000 clamped=5.000000; "
+        "gripper requested=0.000000 current=50.000000 clamped=45.000000"
+    ]
