@@ -9,6 +9,7 @@ import logging
 import math
 import sys
 import time
+from dataclasses import replace
 
 from lerobot.motors import MotorCalibration, MotorNormMode
 from lerobot.motors.dynamixel import DynamixelMotorsBus, OperatingMode
@@ -19,6 +20,12 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from .config_yam_leader import YAMLeaderTeleopConfig
 
 logger = logging.getLogger(__name__)
+
+# XL330-M077 / M288 share the X-series table; GELLO leaders only read position.
+_XL330_MODEL_NUMBERS = {
+    1190: "xl330-m077",
+    1200: "xl330-m288",
+}
 
 
 class YAMLeader(Teleoperator):
@@ -82,6 +89,7 @@ class YAMLeader(Teleoperator):
         # YAM leader uses 57600 baud (not lerobot's default 1MHz)
         self.bus.connect(handshake=False)
         self.bus.set_baudrate(self.config.baudrate)
+        self._bind_detected_xl330_models()
         self.bus._handshake()
 
         if not self.is_calibrated and calibrate:
@@ -93,10 +101,34 @@ class YAMLeader(Teleoperator):
 
         self.configure()
 
-        if self.config.preflight_range_check:
+        if self.config.preflight_range_check and self.calibration:
             self._preflight_range_check()
 
         logger.info(f"{self} connected.")
+
+    def _bind_detected_xl330_models(self) -> None:
+        """Set each motor's model from a ping so M077 and M288 GELLOs both handshake."""
+        found = self.bus.broadcast_ping() or {}
+        id_to_name = {motor.id: name for name, motor in self.bus.motors.items()}
+        for dxl_id, model_nb in found.items():
+            name = id_to_name.get(dxl_id)
+            if name is None:
+                continue
+            model = _XL330_MODEL_NUMBERS.get(int(model_nb))
+            if model is None:
+                continue
+            motor = self.bus.motors[name]
+            if motor.model == model:
+                continue
+            logger.info(
+                "GELLO %s (id=%s): using %s (model %s) instead of %s",
+                name,
+                dxl_id,
+                model,
+                model_nb,
+                motor.model,
+            )
+            self.bus.motors[name] = replace(motor, model=model)
 
     def calibrate(self) -> None:
         """Calibrate the leader by recording joint ranges of motion."""
