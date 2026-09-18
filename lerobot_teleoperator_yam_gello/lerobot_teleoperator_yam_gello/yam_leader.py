@@ -92,14 +92,17 @@ class YAMLeader(Teleoperator):
         self._bind_detected_xl330_models()
         self.bus._handshake()
 
+        # Position mode before any Present_Position read. Current/extended
+        # position reports signed multi-turn ticks (-1, 7227, …); calibration
+        # and preflight need the 0–4095 joint circle.
+        self.configure()
+
         if not self.is_calibrated and calibrate:
             logger.info("Teleoperator not calibrated. Starting calibration...")
             self.calibrate()
         else:
             # Cache calibration state without probing hardware every call
             self._is_calibrated_cached = bool(self.calibration)
-
-        self.configure()
 
         if self.config.preflight_range_check and self.calibration:
             self._preflight_range_check()
@@ -148,8 +151,8 @@ class YAMLeader(Teleoperator):
         logger.info(f"\nRunning calibration for {self}")
         print("For each joint: move through full range of motion, then press ENTER.\n")
 
-        # Ensure torque is disabled for free movement
-        self.bus.disable_torque()
+        # Force POSITION (mode 3) before recording ticks. Torque stays off.
+        self.configure()
 
         # Record min/max for each joint
         range_mins = {}
@@ -222,13 +225,18 @@ class YAMLeader(Teleoperator):
         logger.info(f"Calibration saved to {self.calibration_fpath}")
 
     def configure(self) -> None:
-        """Configure teleoperator after connection."""
+        """Disable torque and lock every XL330 in POSITION mode (mode 3)."""
         self.bus.disable_torque()
         self.bus.configure_motors()
 
-        # Set all motors to position mode (for reading Present_Position)
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
+            mode = int(self.bus.read("Operating_Mode", motor))
+            if mode != OperatingMode.POSITION.value:
+                raise RuntimeError(
+                    f"{motor} Operating_Mode={mode}, expected POSITION "
+                    f"({OperatingMode.POSITION.value})"
+                )
 
     def get_action(self) -> dict[str, float]:
         """Read current joint positions from the leader arm.
