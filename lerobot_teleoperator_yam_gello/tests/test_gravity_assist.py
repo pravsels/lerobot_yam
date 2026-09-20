@@ -105,6 +105,50 @@ def test_config_defaults_to_z_down_urdf_and_validates_sign():
         YAMLeaderConfig(gravity_urdf_z_sign=2)
 
 
+def test_link_mass_override_scales_torques_linearly():
+    base_model = GelloGravityModel()
+    base_masses = list(base_model.link_masses.values())
+    doubled = GelloGravityModel(link_masses_kg=[2 * m for m in base_masses])
+
+    q = np.array([0.2, 1.0, 0.8, -0.3, 0.1, 0.4])
+    assert np.allclose(
+        doubled.gravity_torques(q), 2.0 * base_model.gravity_torques(q)
+    )
+    with pytest.raises(ValueError, match="link_masses_kg"):
+        GelloGravityModel(link_masses_kg=[0.1, 0.2])
+    with pytest.raises(ValueError, match="gravity_link_masses_kg"):
+        YAMLeaderConfig(gravity_link_masses_kg=(0.1, 0.2))
+
+
+def test_follower_buffer_padding_removes_end_of_travel_dead_zone():
+    """Leader at its physical stop must command the YAM's *true* limit.
+
+    The YAM normalizes over joint limits with a ±0.15 rad software buffer
+    (elbow true range [0, 3.13], buffered [-0.15, 3.28]) while a GELLO sweep
+    records only the true range. Unpadded, the leader endpoint commanded
+    -0.15 rad — 0.15 rad below anything reachable — a dead zone at rest.
+    """
+    leader = _bare_leader(YAMLeaderConfig())
+    cal = leader.calibration["elbow_flex"]
+    cal.range_min, cal.range_max = 0, 3130  # swept true range, ~1000 ticks/rad
+
+    normalized = leader._normalize_ticks("elbow_flex", 0)
+    lo_b, hi_b = leader.config.gravity_joint_ranges_rad[2]
+    commanded_rad = lo_b + ((normalized + 100.0) / 200.0) * (hi_b - lo_b)
+
+    assert commanded_rad == pytest.approx(0.0, abs=1e-6)  # true limit, not -0.15
+    assert normalized == pytest.approx(-91.25, abs=0.05)
+
+    # And with the buffer disabled, the old endpoint behavior returns.
+    leader_unpadded = _bare_leader(YAMLeaderConfig(follower_limit_buffer_rad=0.0))
+    cal = leader_unpadded.calibration["elbow_flex"]
+    cal.range_min, cal.range_max = 0, 3130
+    assert leader_unpadded._normalize_ticks("elbow_flex", 0) == pytest.approx(-100.0)
+
+    # The gripper trigger keeps its swept window untouched.
+    assert leader._normalization_window("gripper") == (100.0, 1000.0)
+
+
 def test_normalized_joint_mapping_uses_yam_ranges():
     q = normalized_to_joint_positions(
         [-100, 100, 0, -100, 100, 0],

@@ -21,8 +21,9 @@ ARM_JOINT_NAMES = (
 )
 
 # The LeRobot calibration maps each GELLO joint to the matching YAM follower's
-# normalized range. These physical ranges turn that normalized value back into
-# the generalized coordinates used by the GELLO dynamics model.
+# normalized range. These are the follower's *buffered* joint limits (i2rt
+# defaults). They turn normalized values back into radians for the gravity
+# model, and size the follower_limit_buffer_rad padding below.
 DEFAULT_YAM_JOINT_RANGES_RAD = (
     (-2.767, 3.28),
     (-0.15, 3.8),
@@ -64,6 +65,15 @@ class YAMLeaderConfig:
     # Tolerance band (in normalized units) to avoid flicker right at the boundary.
     out_of_range_tolerance: float = 1.0
 
+    # i2rt's YAM follower normalizes over joint limits that include a ±0.15 rad
+    # software buffer beyond the true mechanical range, while a GELLO sweep
+    # records only the true range. Without compensation the leader's endpoints
+    # command unreachable targets, so every joint gets a ~0.15 rad dead zone at
+    # each end of travel (felt worst at the elbow's rest pose, which sits at
+    # the true limit). Padding the normalization window by this buffer makes
+    # leader stops map to the true limits instead. Set 0 to disable.
+    follower_limit_buffer_rad: float = 0.15
+
     # Active assistance is deliberately opt-in. The passive GELLO uses XL330s,
     # which are substantially weaker than the XC/XM servos in FACTR's active
     # GELLO. Defaults therefore provide partial support, not hands-off holding.
@@ -85,6 +95,12 @@ class YAMLeaderConfig:
     # (-1) for the standard tabletop mount; with the wrong value every assist
     # torque is inverted and the arm is pushed toward its fallen pose.
     gravity_urdf_z_sign: int = -1
+    # Optional per-link mass override (kg), base to tip: link_base, link_1 …
+    # link_6 (7 values). Gravity torque is linear in these masses, so this is
+    # the sysid knob for leaders built differently from the bundled URDF
+    # (e.g. TRLC-DK1): weigh the printed links, or tune from dry-run logs.
+    # Empty tuple keeps the URDF masses.
+    gravity_link_masses_kg: tuple[float, ...] = ()
     # Compute and log assist currents without configuring motors or applying
     # any torque. Use this first on new hardware to verify signs/offsets.
     gravity_assist_dry_run: bool = False
@@ -134,6 +150,17 @@ class YAMLeaderConfig:
             raise ValueError("gravity_joint_offsets_rad values must be finite")
         if int(self.gravity_urdf_z_sign) not in {-1, 1}:
             raise ValueError("gravity_urdf_z_sign must be -1 or 1")
+        if self.gravity_link_masses_kg and len(self.gravity_link_masses_kg) != 7:
+            raise ValueError(
+                "gravity_link_masses_kg must be empty or 7 values (base to tip)"
+            )
+        if any(
+            not math.isfinite(float(m)) or float(m) < 0
+            for m in self.gravity_link_masses_kg
+        ):
+            raise ValueError("gravity_link_masses_kg values must be finite and >= 0")
+        if not 0.0 <= self.follower_limit_buffer_rad < 0.5:
+            raise ValueError("follower_limit_buffer_rad must be in [0, 0.5)")
         if not 35 <= self.assist_temperature_limit_c <= 60:
             raise ValueError("assist_temperature_limit_c must be in [35, 60]")
         if not 100 <= self.assist_bus_watchdog_ms <= 1000:

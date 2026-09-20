@@ -345,7 +345,12 @@ class YAMLeader(Teleoperator):
 
         if self.config.gravity_assist:
             self._gravity_model = GelloGravityModel(
-                gravity_z_sign=self.config.gravity_urdf_z_sign
+                gravity_z_sign=self.config.gravity_urdf_z_sign,
+                link_masses_kg=self.config.gravity_link_masses_kg or None,
+            )
+            logger.info(
+                "GELLO gravity model link masses (kg): %s",
+                {k: round(v, 4) for k, v in self._gravity_model.link_masses.items()},
             )
         if self.config.gravity_assist and not live_gravity:
             logger.warning(
@@ -693,6 +698,29 @@ class YAMLeader(Teleoperator):
         cal = self.calibration[motor_name]
         return (cal.range_min - tol_ticks) <= ticks <= (cal.range_max + tol_ticks)
 
+    def _normalization_window(self, motor_name: str) -> tuple[float, float]:
+        """The tick window normalization maps onto [-100, 100].
+
+        For arm joints this is the swept calibration window padded by the
+        follower's ±0.15 rad joint-limit buffer (converted to ticks). The YAM
+        normalizes over its *buffered* limits, so an unpadded leader endpoint
+        commands an unreachable target and the joint gets a dead zone at each
+        end of travel. Range/preflight checks still use the raw swept window.
+        """
+        cal = self.calibration[motor_name]
+        lo, hi = float(cal.range_min), float(cal.range_max)
+        buffer_rad = float(self.config.follower_limit_buffer_rad)
+        if motor_name not in ARM_JOINT_NAMES or buffer_rad <= 0.0 or hi <= lo:
+            return lo, hi
+        index = ARM_JOINT_NAMES.index(motor_name)
+        range_lo, range_hi = self.config.gravity_joint_ranges_rad[index]
+        true_span_rad = (float(range_hi) - float(range_lo)) - 2.0 * buffer_rad
+        if true_span_rad <= 0.0:
+            return lo, hi
+        ticks_per_rad = (hi - lo) / true_span_rad
+        pad = ticks_per_rad * buffer_rad
+        return lo - pad, hi + pad
+
     def _normalize_ticks(self, motor_name: str, ticks: int) -> float:
         """Replicate lerobot _normalize() formula manually for a single motor.
 
@@ -701,7 +729,7 @@ class YAMLeader(Teleoperator):
         """
         cal = self.calibration[motor_name]
         motor = self.bus.motors[motor_name]
-        lo, hi = cal.range_min, cal.range_max
+        lo, hi = self._normalization_window(motor_name)
         if hi == lo:
             return 0.0
         bounded = min(hi, max(lo, ticks))

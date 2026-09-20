@@ -104,6 +104,7 @@ class GelloGravityModel:
         self,
         urdf_path: str | Path | None = None,
         gravity_z_sign: int = -1,
+        link_masses_kg: Sequence[float] | None = None,
     ) -> None:
         if int(gravity_z_sign) not in (-1, 1):
             raise ValueError("gravity_z_sign must be -1 or 1")
@@ -112,6 +113,33 @@ class GelloGravityModel:
         self._links, self._joints = _read_urdf(self.urdf_path)
         if len(self._joints) != 6:
             raise ValueError(f"expected six revolute joints in {self.urdf_path}")
+        # Base-to-tip link order: gravity torque is linear in these masses, so
+        # overriding them adapts the model to a differently built leader (e.g.
+        # a TRLC-DK1) without touching the kinematics.
+        self.link_order = [self._joints[0].parent] + [
+            joint.child for joint in self._joints
+        ]
+        if link_masses_kg is not None:
+            masses = [float(mass) for mass in link_masses_kg]
+            if len(masses) != len(self.link_order):
+                raise ValueError(
+                    f"link_masses_kg needs {len(self.link_order)} values, "
+                    f"base to tip: {self.link_order}"
+                )
+            if any(not math.isfinite(mass) or mass < 0 for mass in masses):
+                raise ValueError("link_masses_kg values must be finite and >= 0")
+            for name, mass in zip(self.link_order, masses, strict=True):
+                existing = self._links.get(name)
+                com = existing.com if existing is not None else np.zeros(3)
+                self._links[name] = _LinkInertia(mass=mass, com=com)
+
+    @property
+    def link_masses(self) -> dict[str, float]:
+        """Masses currently used by the model, base to tip (kg)."""
+        return {
+            name: (self._links[name].mass if name in self._links else 0.0)
+            for name in self.link_order
+        }
 
     def potential_energy(self, joint_positions: Sequence[float]) -> float:
         q = np.asarray(joint_positions, dtype=np.float64)
