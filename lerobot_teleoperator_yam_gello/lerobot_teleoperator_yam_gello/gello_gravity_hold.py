@@ -48,6 +48,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("Refusing to energize motors without --enable-torque-output")
 
     joints = ARM_JOINT_NAMES if args.joints == ("all",) else args.joints
+    range_override = (
+        {"gravity_joint_ranges_rad": tuple(zip(args.ranges[::2], args.ranges[1::2]))}
+        if args.ranges
+        else {}
+    )
     config = YAMLeaderTeleopConfig(
         port=args.port,
         id=args.id,
@@ -62,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         gravity_joint_offsets_rad=args.offsets,
         gravity_link_masses_kg=args.masses,
         gravity_urdf_z_sign=args.z_sign,
+        **range_override,
     )
     leader = YAMLeader(config)
     leader.connect(calibrate=False)
@@ -197,6 +203,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--offsets", type=_csv(float, 6, "--offsets"), default=(0.0,) * 6)
     parser.add_argument("--masses", type=_csv(float, 7, "--masses"), default=())
     parser.add_argument("--z-sign", type=int, choices=(1, -1), default=-1)
+    parser.add_argument(
+        "--ranges",
+        type=_csv(float, 12, "--ranges"),
+        default=(),
+        metavar="LO1,HI1,...,LO6,HI6",
+        help="Override the per-joint physical ranges (rad); see gello_gravity_sysid --ranges",
+    )
     parser.add_argument(
         "--no-lock-others",
         dest="lock_others",
