@@ -367,10 +367,8 @@ class YAMLeader(Teleoperator):
                 )
                 self.bus.write("Operating_Mode", motor, OperatingMode.CURRENT.value)
                 self.bus.write("Bus_Watchdog", motor, watchdog_raw)
-                self.bus.write("Goal_Current", motor, 0, normalize=False)
 
         if self.config.gripper_return:
-            open_tick = self._gripper_open_tick()
             self._set_current_limit_if_needed(
                 "gripper", self.config.gripper_return_current_ma
             )
@@ -378,18 +376,31 @@ class YAMLeader(Teleoperator):
                 "Operating_Mode", "gripper", OperatingMode.CURRENT_POSITION.value
             )
             self.bus.write("Bus_Watchdog", "gripper", watchdog_raw)
+
+        # Goal registers MUST be written after enable_torque: the firmware
+        # resets Goal_Position to Present_Position at torque-on in position
+        # modes, so a goal written earlier is silently replaced by wherever the
+        # trigger happened to rest — a spring that holds the trigger closed if
+        # it was parked closed at connect (observed on the right leader).
+        self.bus.enable_torque(assisted_motors)
+        if live_gravity:
+            for motor in arm_motors:
+                self.bus.write("Goal_Current", motor, 0, normalize=False)
+        if self.config.gripper_return:
+            open_tick = self._gripper_open_tick()
             self.bus.write(
                 "Goal_Current",
                 "gripper",
                 self.config.gripper_return_current_ma,
                 normalize=False,
             )
-            self.bus.write(
-                "Goal_Position",
-                "gripper",
-                open_tick,
-                normalize=False,
-            )
+            self.bus.write("Goal_Position", "gripper", open_tick, normalize=False)
+            applied = int(self.bus.read("Goal_Position", "gripper", normalize=False))
+            if applied != int(open_tick):
+                raise RuntimeError(
+                    f"gripper spring goal readback mismatch: wrote {open_tick}, "
+                    f"motor holds {applied} — goal was reset by the firmware"
+                )
             calibration = self.calibration["gripper"]
             logger.warning(
                 "GELLO gripper return target: port=%s open_tick=%d "
@@ -400,8 +411,6 @@ class YAMLeader(Teleoperator):
                 calibration.range_max,
                 self.config.gripper_return_current_ma,
             )
-
-        self.bus.enable_torque(assisted_motors)
         self._live_assist_motors = list(assisted_motors)
         self._assist_enabled = True
         self._assist_faulted = False

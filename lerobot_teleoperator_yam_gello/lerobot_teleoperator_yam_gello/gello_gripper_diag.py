@@ -49,7 +49,7 @@ def _dump(bus, label: str) -> None:
     print(f"\n--- gripper control table [{label}] ---")
     for register in _REGISTERS:
         try:
-            value = bus.read(register, "gripper")
+            value = bus.read(register, "gripper", normalize=False)
         except Exception as exc:  # noqa: BLE001 - keep dumping the rest
             value = f"<read failed: {exc}>"
         print(f"  {register:24s} {value}")

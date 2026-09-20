@@ -23,18 +23,23 @@ class _FakeBus:
         self.writes = []
         self.enabled = []
         self.disable_calls = []
+        self._registers = {}
         self.sync_read_values = {
             "Present_Temperature": 30,
             "Hardware_Error_Status": 0,
             "Bus_Watchdog": 1,
         }
 
-    def read(self, name, motor):
-        assert name == "Current_Limit"
-        return 1750
+    def read(self, name, motor, **kwargs):
+        if (name, motor) in self._registers:
+            return self._registers[(name, motor)]
+        if name == "Current_Limit":
+            return 1750
+        return 0
 
     def write(self, name, motor, value, **kwargs):
         self.writes.append((name, motor, value, kwargs))
+        self._registers[(name, motor)] = value
 
     def sync_read(self, name, motors=None, **kwargs):
         value = self.sync_read_values[name]
@@ -45,6 +50,8 @@ class _FakeBus:
 
     def enable_torque(self, motors=None, **kwargs):
         self.enabled.append(motors)
+        # Marker row so tests can assert write-vs-enable ordering.
+        self.writes.append(("__enable_torque__", None, tuple(motors or ()), {}))
 
     def disable_torque(self, motors=None, **kwargs):
         self.disable_calls.append(motors)
@@ -288,6 +295,40 @@ def test_enable_assistance_uses_current_modes_limits_watchdog_and_open_target():
         "gripper",
     ]
     assert leader._live_assist_motors[-1] == "gripper"
+
+
+def test_goal_registers_are_written_after_torque_enable():
+    """Regression: the firmware resets Goal_Position to Present_Position at
+    torque-on in position modes. A goal written before enable_torque is
+    silently replaced by wherever the trigger rests — a spring that held the
+    right leader's trigger closed whenever it was parked closed at connect."""
+    leader = _bare_leader(
+        YAMLeaderConfig(gravity_assist=True, gripper_return=True)
+    )
+
+    leader._enable_assistance()
+
+    writes = leader.bus.writes
+    enable_index = writes.index(
+        next(w for w in writes if w[0] == "__enable_torque__" and w[2])
+    )
+    goal_position_index = writes.index(
+        next(w for w in writes if w[0] == "Goal_Position" and w[1] == "gripper")
+    )
+    gripper_current_index = writes.index(
+        next(w for w in writes if w[0] == "Goal_Current" and w[1] == "gripper")
+    )
+    arm_zero_index = writes.index(
+        next(w for w in writes if w[0] == "Goal_Current" and w[1] == "shoulder_pan")
+    )
+    assert goal_position_index > enable_index
+    assert gripper_current_index > enable_index
+    assert arm_zero_index > enable_index
+    # Mode/watchdog writes must stay BEFORE enable (mode needs torque off).
+    mode_index = writes.index(
+        next(w for w in writes if w[0] == "Operating_Mode" and w[1] == "gripper")
+    )
+    assert mode_index < enable_index
 
 
 def test_dry_run_configures_no_arm_motors_and_writes_no_currents():
