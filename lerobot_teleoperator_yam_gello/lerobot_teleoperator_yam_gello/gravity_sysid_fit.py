@@ -57,11 +57,17 @@ class SineFit:
 
 @dataclass(frozen=True)
 class Corrections:
-    """Suggested config changes derived from measured vs model fits."""
+    """Suggested config changes derived from measured vs model fits.
+
+    `reliable=False` means the numbers must not be applied: the fit was
+    degenerate (clustered angles) or physically implausible (amplitude beyond
+    what an XL330 could ever balance).
+    """
 
     offset_delta_rad: float
     amplitude_ratio: float
     warnings: tuple[str, ...]
+    reliable: bool = True
 
 
 def balance_and_friction(edge_low_ma: float, edge_high_ma: float) -> tuple[float, float]:
@@ -163,10 +169,20 @@ def suggest_corrections(
     so `delta = phi_s - phi_m` and the distal masses scale by `A_s / A_m`.
     """
     warnings: list[str] = []
+    reliable = True
     if measured.condition_number > max_condition:
+        reliable = False
         warnings.append(
             f"measured fit is ill-conditioned ({measured.condition_number:.0f}); "
             "the poses did not vary this joint's angle enough — spread them out"
+        )
+    if measured.amplitude > 2500.0:
+        # The XL330 stalls at ~1470 mA; a larger fitted balance amplitude is a
+        # degenerate-fit artifact, not physics.
+        reliable = False
+        warnings.append(
+            f"fitted amplitude {measured.amplitude:.0f} mA exceeds anything an "
+            "XL330 could balance; the fit is an extrapolation artifact"
         )
     if measured.amplitude < min_amplitude_ma:
         warnings.append(
@@ -192,6 +208,7 @@ def suggest_corrections(
         offset_delta_rad=wrap_angle(measured.phase_rad - model.phase_rad),
         amplitude_ratio=ratio,
         warnings=tuple(warnings),
+        reliable=reliable,
     )
 
 

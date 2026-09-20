@@ -37,6 +37,7 @@ def test_suggested_offset_delta_recovers_known_phase_shift():
     assert corrections.offset_delta_rad == pytest.approx(0.785, abs=1e-6)
     assert corrections.amplitude_ratio == pytest.approx(1.0, abs=1e-6)
     assert corrections.warnings == ()
+    assert corrections.reliable is True
 
 
 def test_amplitude_ratio_reflects_distal_mass_error():
@@ -57,6 +58,20 @@ def test_clustered_poses_are_flagged_as_ill_conditioned():
     corrections = suggest_corrections(measured_fit, model_fit)
 
     assert any("ill-conditioned" in w for w in corrections.warnings)
+    assert corrections.reliable is False
+
+
+def test_implausible_amplitude_marks_fit_unreliable():
+    """Regression from real bench data: a clustered-angle fit extrapolated to a
+    25 A 'amplitude'; such a suggestion must be withheld, not printed."""
+    theta = np.linspace(1.0, 1.05, 4)
+    measured_fit = fit_sine(theta, _sine(theta, 25378.0, -2.44, -24528.0))
+    model_fit = fit_sine(theta, _sine(theta, 137.0, -2.2, 1243.0))
+
+    corrections = suggest_corrections(measured_fit, model_fit)
+
+    assert corrections.reliable is False
+    assert any("XL330 could balance" in w for w in corrections.warnings)
 
 
 def test_tiny_amplitude_flags_unreliable_phase():

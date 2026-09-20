@@ -494,6 +494,15 @@ class SysidSession:
         for warning in corrections.warnings:
             print(f"WARNING: {warning}")
 
+        if not corrections.reliable:
+            payload["suggested_offsets_rad"] = None
+            print(
+                "\nNO SUGGESTION: the fit is unreliable (see warnings above). "
+                "Do not apply these numbers — collect poses spread across the "
+                "joint's full range, including past the balance apex, and rerun."
+            )
+            return payload
+
         new_offsets = apply_offset_delta(
             self.leader.config.gravity_joint_offsets_rad,
             self.joint_index,
