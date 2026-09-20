@@ -69,6 +69,27 @@ Safety measures:
   temperature reaching 50 °C;
 - disconnect writes zero current and disables torque.
 
+### Measuring corrections instead of guessing: `gello_gravity_sysid`
+
+When assist feels wrong (holds at one pose, drives at others), measure the
+joint's real gravity curve on the bench and fit the corrections:
+
+```bash
+python -m lerobot_teleoperator_yam_gello.gello_gravity_sysid \
+  --port /dev/ttyUSB0 --id yam_gello_left \
+  --joint elbow_flex --poses 5 --enable-torque-output
+```
+
+For each operator-arranged pose it locks the other joints (current-capped
+position hold), bisects the two breakaway edges of the test joint's
+holding-current interval, and after >= 3 poses fits measured vs model balance
+currents to print a suggested `gravity_joint_offsets_rad` delta (phase gap),
+a distal mass scale (amplitude ratio), and the measured stiction band. Every
+probe is dumped to a JSON diagnostics file. Spread the test joint's angles as
+widely as safely possible — clustered poses make the fit ill-conditioned (the
+tool warns). The test joint moves during measurement; keep the workspace
+clear, and power-cycle the leader if the process is ever killed ungracefully.
+
 FACTR's YAM motor directions are the defaults:
 `[1, -1, -1, -1, 1, 1]`. Signs and `gravity_joint_offsets_rad` are applied in
 radian space (`q_urdf = sign * q_yam + offset`); offsets are usually 0 or
