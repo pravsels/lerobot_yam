@@ -155,6 +155,77 @@ def wrap_angle(angle_rad: float) -> float:
     return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
 
 
+@dataclass(frozen=True)
+class ApexSolution:
+    """Joint offset solved from a physically captured over-center (apex) pose.
+
+    At the apex the joint's gravity torque is exactly zero and the *holding
+    current has negative slope* (unstable equilibrium: past the apex, gravity
+    pulls away, so the required current flips sign). A joint's torque is a pure
+    sinusoid in its own offset, so two model evaluations give both zeros
+    analytically; the slope test picks the apex zero over the hanging
+    (stable, COM-down) zero half a turn away.
+    """
+
+    offset_apex_rad: float
+    offset_hanging_rad: float
+    amplitude_nm: float
+
+
+def solve_apex_offset(
+    model,
+    q_yam: Sequence[float],
+    signs: Sequence[int],
+    offsets_rad: Sequence[float],
+    joint_index: int,
+) -> ApexSolution:
+    """Offset placing the model's torque zero at the captured apex pose.
+
+    `q_yam` is the full six-joint pose (follower radians) captured while the
+    operator balances the joint under test at its physical over-center pose.
+    Other joints use their configured signs/offsets.
+    """
+    q = np.asarray(q_yam, dtype=np.float64)
+    signs_arr = np.asarray(signs, dtype=np.float64)
+
+    def torque_with(offset: float, q_pose: np.ndarray = q) -> float:
+        offs = np.asarray(offsets_rad, dtype=np.float64).copy()
+        offs[joint_index] = offset
+        q_urdf = signs_arr * q_pose + offs
+        return float(model.gravity_torques(q_urdf)[joint_index])
+
+    # tau(o) = tau(0)*cos(o) + tau(pi/2)*sin(o): a sinusoid in the offset.
+    tau_0 = torque_with(0.0)
+    tau_90 = torque_with(math.pi / 2.0)
+    amplitude = math.hypot(tau_0, tau_90)
+    if amplitude < 1e-4:
+        raise ValueError(
+            "no gravity signal for this joint at the captured pose; "
+            "the distal chain is (modeled as) weightless or aligned with the axis"
+        )
+    zero = math.atan2(-tau_0, tau_90)
+    candidates = (wrap_angle(zero), wrap_angle(zero + math.pi))
+
+    def is_apex(offset: float) -> bool:
+        eps = 1e-3
+        plus, minus = q.copy(), q.copy()
+        plus[joint_index] += eps
+        minus[joint_index] -= eps
+        dtau_dq = (torque_with(offset, plus) - torque_with(offset, minus)) / (2 * eps)
+        # Motor-frame holding current is sign * tau; apex requires its slope
+        # over the motor angle to be negative.
+        return float(signs[joint_index]) * dtau_dq < 0.0
+
+    apex, hanging = (
+        (candidates[0], candidates[1])
+        if is_apex(candidates[0])
+        else (candidates[1], candidates[0])
+    )
+    return ApexSolution(
+        offset_apex_rad=apex, offset_hanging_rad=hanging, amplitude_nm=amplitude
+    )
+
+
 def suggest_corrections(
     measured: SineFit,
     model: SineFit,

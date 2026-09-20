@@ -137,3 +137,60 @@ def test_edge_event_fit_requires_both_directions():
 
     with pytest.raises(ValueError, match="both directions"):
         fit_edge_events([0.0, 0.5, 1.0, 1.5], [10, 20, 30, 40], [1, 1, 1, 1])
+
+
+def test_apex_capture_places_torque_zero_with_unstable_slope():
+    from lerobot_teleoperator_yam_gello.gravity_assist import GelloGravityModel
+    from lerobot_teleoperator_yam_gello.gravity_sysid_fit import solve_apex_offset
+
+    model = GelloGravityModel()
+    signs = (1, -1, -1, -1, 1, 1)
+    offsets = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    q_yam = np.array([0.1, 0.6, 1.2, 0.05, 0.0, -0.3])
+    joint = 2  # elbow_flex
+
+    solution = solve_apex_offset(model, q_yam, signs, offsets, joint)
+
+    def torque_at(offset, q):
+        offs = list(offsets)
+        offs[joint] = offset
+        q_urdf = np.asarray(signs, float) * q + np.asarray(offs)
+        return float(model.gravity_torques(q_urdf)[joint])
+
+    # Zero torque at the captured pose for both candidate offsets...
+    assert torque_at(solution.offset_apex_rad, q_yam) == pytest.approx(0.0, abs=1e-3)
+    assert torque_at(solution.offset_hanging_rad, q_yam) == pytest.approx(0.0, abs=1e-3)
+    # ...but only the apex offset gives a motor current with negative slope
+    # (unstable equilibrium: the commanded current flips sign across the apex).
+    eps = 1e-3
+    plus, minus = q_yam.copy(), q_yam.copy()
+    plus[joint] += eps
+    minus[joint] -= eps
+    apex_slope = signs[joint] * (
+        torque_at(solution.offset_apex_rad, plus) - torque_at(solution.offset_apex_rad, minus)
+    )
+    hanging_slope = signs[joint] * (
+        torque_at(solution.offset_hanging_rad, plus)
+        - torque_at(solution.offset_hanging_rad, minus)
+    )
+    assert apex_slope < 0
+    assert hanging_slope > 0
+    assert solution.amplitude_nm > 0.05
+
+
+def test_apex_capture_rejects_weightless_distal_chain():
+    from lerobot_teleoperator_yam_gello.gravity_assist import GelloGravityModel
+    from lerobot_teleoperator_yam_gello.gravity_sysid_fit import solve_apex_offset
+
+    model = GelloGravityModel(
+        link_masses_kg=[0.142, 0.09, 0.12, 0.0, 0.0, 0.0, 0.0]
+    )
+
+    with pytest.raises(ValueError, match="no gravity signal"):
+        solve_apex_offset(
+            model,
+            np.zeros(6),
+            (1, -1, -1, -1, 1, 1),
+            [0.0] * 6,
+            2,
+        )

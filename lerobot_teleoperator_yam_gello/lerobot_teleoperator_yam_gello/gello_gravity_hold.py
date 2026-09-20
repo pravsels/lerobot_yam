@@ -36,6 +36,7 @@ from lerobot.motors.dynamixel import OperatingMode
 
 from .config_yam_leader import ARM_JOINT_NAMES, YAMLeaderTeleopConfig
 from .gravity_assist import GelloGravityModel, gello_joint_positions, torque_to_current_ma
+from .gravity_sysid_fit import wrap_angle
 from .yam_leader import YAMLeader
 
 _UNCLIPPED_MA = 1_000_000
@@ -148,7 +149,7 @@ def _status_line(leader: YAMLeader, model, joints, action) -> str:
             cfg.gravity_assist_current_limit_ma,
         )
         parts.append(
-            f"{name}: q={float(q[index]):+.2f} cmd={commanded:+d}mA "
+            f"{name}: q={wrap_angle(float(q[index])):+.2f} cmd={commanded:+d}mA "
             f"meas={int(measured[name]):+d}mA {int(temps[name])}C"
         )
     return "  |  ".join(parts)

@@ -57,7 +57,9 @@ from .gravity_sysid_fit import (
     balance_and_friction,
     fit_edge_events,
     fit_sine,
+    solve_apex_offset,
     suggest_corrections,
+    wrap_angle,
 )
 from .yam_leader import YAMLeader
 
@@ -170,6 +172,9 @@ class SysidSession:
             cfg.gravity_joint_signs,
             cfg.gravity_joint_offsets_rad,
         )
+        # Wrap for readability (and sane fits/logs): the model is exactly
+        # 2*pi-periodic, so -4.1 rad and +2.18 rad are the same pose to it.
+        q_urdf = np.asarray([wrap_angle(float(v)) for v in q_urdf])
         return {name: int(ticks[name]) for name in ARM_JOINT_NAMES}, q_yam, q_urdf
 
     def model_balance_ma(self, q_urdf: np.ndarray) -> tuple[float, float]:
@@ -554,6 +559,8 @@ def main(argv: list[str] | None = None) -> int:
         gravity_z_sign=args.z_sign, link_masses_kg=args.masses or None
     )
     session = SysidSession(leader, model, args)
+    if args.capture_apex:
+        return _capture_apex(session, leader, args)
     print(
         f"\nGELLO gravity sysid on {args.joint} ({args.port}); test cap "
         f"{session.test_cap} mA, locks {args.lock_current_ma} mA. The test joint "
@@ -577,6 +584,82 @@ def main(argv: list[str] | None = None) -> int:
         Path(out).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         print(f"\ndiagnostics written to {out} — send this file back for analysis")
         leader.disconnect()
+    return 0
+
+
+def _capture_apex(session: SysidSession, leader: YAMLeader, args) -> int:
+    """Solve the joint's offset from a physically balanced over-center pose.
+
+    No fitting and no torque on the test joint: the operator balances the
+    joint at its 12 o'clock pose; the offset that puts the model's torque zero
+    exactly there (with the unstable-slope zero, so the commanded current
+    flips sign on the correct side) is computed analytically.
+    """
+    print(
+        f"\nAPEX CAPTURE for {args.joint}: arrange the whole arm, then balance "
+        f"ONLY the {args.joint} segment at its over-center (12 o'clock) pose — "
+        "the point where it falls neither way. Other joints will be locked.\n"
+        "Arrange the arm now, then press ENTER to lock."
+    )
+    try:
+        input()
+        ticks, _, _ = session.arm_state()
+        session.lock_others(ticks)
+        print("Balance the joint at the apex, then press ENTER.")
+        session._wait_for_enter_with_live_display()
+        _, q_yam, _ = session.arm_state()
+        solution = solve_apex_offset(
+            session.model,
+            q_yam,
+            leader.config.gravity_joint_signs,
+            leader.config.gravity_joint_offsets_rad,
+            session.joint_index,
+        )
+    except KeyboardInterrupt:
+        print("\ninterrupted; releasing")
+        return 1
+    finally:
+        session.release_all()
+        leader.disconnect()
+
+    amp_ma = torque_to_current_ma(
+        solution.amplitude_nm, session.bus.motors[args.joint].model, _UNCLIPPED_MA
+    )
+    new_offsets = list(leader.config.gravity_joint_offsets_rad)
+    new_offsets[session.joint_index] = solution.offset_apex_rad
+    print(f"\ncaptured q_yam: {[round(float(v), 4) for v in q_yam]}")
+    print(
+        f"(shoulder_lift was {float(q_yam[1]):+.3f} rad — capture again at a "
+        "clearly different lift to check the lift/elbow coupling sign: the two "
+        "suggested offsets must agree)"
+    )
+    print(
+        f"apex offset for {args.joint}: {solution.offset_apex_rad:+.4f} rad "
+        f"(hanging alternative {solution.offset_hanging_rad:+.4f}; "
+        f"gravity amplitude {solution.amplitude_nm:.4f} Nm ≈ {amp_ma} mA)"
+    )
+    print(
+        "suggested --teleop.gravity-joint-offsets="
+        + ",".join(f"{v:.4f}" for v in new_offsets)
+    )
+    payload = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "mode": "capture_apex",
+        "joint": args.joint,
+        "q_yam": [float(v) for v in q_yam],
+        "offset_apex_rad": solution.offset_apex_rad,
+        "offset_hanging_rad": solution.offset_hanging_rad,
+        "amplitude_nm": solution.amplitude_nm,
+        "amplitude_ma": amp_ma,
+        "signs": list(leader.config.gravity_joint_signs),
+        "prior_offsets_rad": list(leader.config.gravity_joint_offsets_rad),
+        "suggested_offsets_rad": [float(v) for v in new_offsets],
+    }
+    out = args.out or Path(
+        f"gello_apex_{args.joint}_{datetime.now():%Y%m%d_%H%M%S}.json"
+    )
+    Path(out).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(f"apex capture written to {out}")
     return 0
 
 
@@ -620,6 +703,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--held-drift-limit-ticks", type=float, default=20.0)
     parser.add_argument("--temperature-limit-c", type=int, default=50)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument(
+        "--capture-apex",
+        action="store_true",
+        help="Instead of probing currents, capture the joint's physical "
+        "over-center pose and solve its offset analytically (test joint stays "
+        "passive; other joints are locked)",
+    )
     parser.add_argument(
         "--enable-torque-output", action="store_true", help="required safety acknowledgement"
     )
