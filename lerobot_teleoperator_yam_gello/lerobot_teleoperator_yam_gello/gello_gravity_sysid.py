@@ -280,7 +280,14 @@ class SysidSession:
         while not self._has_both_motions(record) and not self.travel_exceeded(record):
             if len(record.probes) >= self.args.max_probes_per_pose:
                 break
-            for offset in (radius, -radius):
+            # Chase the resisting direction first: a falling joint needs *more*
+            # current, and probing the other way first just lets it keep
+            # falling until the travel guard kills the pose.
+            last_motion = next(
+                (p.motion for p in reversed(record.probes) if p.motion != 0), 0
+            )
+            ordered = (-radius, radius) if last_motion > 0 else (radius, -radius)
+            for offset in ordered:
                 self.probe(record, center + offset)
                 if self._has_both_motions(record) or self.travel_exceeded(record):
                     break
