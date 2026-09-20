@@ -90,9 +90,24 @@ class _Joint:
 
 
 class GelloGravityModel:
-    """Compute six joint gravity torques from the active-GELLO URDF."""
+    """Compute six joint gravity torques from the active-GELLO URDF.
 
-    def __init__(self, urdf_path: str | Path | None = None) -> None:
+    ``gravity_z_sign`` states which way the URDF's +z axis points physically:
+    +1 for up, -1 for down. The bundled ``yam_active_gello`` Onshape export is
+    z-down for the standard tabletop mount (verified on hardware: computing
+    with z-up made the assist push the arm toward its fallen rest pose —
+    every holding torque negated). Getting this bit wrong flips all torques,
+    so validate new hardware with the dry-run mode before applying current.
+    """
+
+    def __init__(
+        self,
+        urdf_path: str | Path | None = None,
+        gravity_z_sign: int = -1,
+    ) -> None:
+        if int(gravity_z_sign) not in (-1, 1):
+            raise ValueError("gravity_z_sign must be -1 or 1")
+        self._gravity_z_sign = int(gravity_z_sign)
         self.urdf_path = Path(urdf_path) if urdf_path else default_urdf_path()
         self._links, self._joints = _read_urdf(self.urdf_path)
         if len(self._joints) != 6:
@@ -140,7 +155,8 @@ class GelloGravityModel:
             return 0.0
         com_h = np.append(inertia.com, 1.0)
         world_com = transform @ com_h
-        return inertia.mass * _G * float(world_com[2])
+        # Physical height is the URDF z coordinate times the frame's z sign.
+        return inertia.mass * _G * self._gravity_z_sign * float(world_com[2])
 
 
 def _read_urdf(path: Path) -> tuple[dict[str, _LinkInertia], list[_Joint]]:

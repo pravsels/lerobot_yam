@@ -87,6 +87,24 @@ def test_gravity_model_asset_is_packaged_and_returns_finite_torques():
     assert np.max(np.abs(torque)) < 2.0
 
 
+def test_gravity_z_sign_negates_every_holding_torque():
+    """Regression: with the wrong frame orientation the assist pushed the arm
+    toward its fallen rest pose — all torques inverted, one global bit."""
+    q = np.array([0.2, 1.0, 0.8, -0.3, 0.1, 0.4])
+    torque_z_down = GelloGravityModel(gravity_z_sign=-1).gravity_torques(q)
+    torque_z_up = GelloGravityModel(gravity_z_sign=1).gravity_torques(q)
+
+    assert np.allclose(torque_z_down, -torque_z_up)
+    with pytest.raises(ValueError, match="gravity_z_sign"):
+        GelloGravityModel(gravity_z_sign=0)
+
+
+def test_config_defaults_to_z_down_urdf_and_validates_sign():
+    assert YAMLeaderConfig().gravity_urdf_z_sign == -1
+    with pytest.raises(ValueError, match="gravity_urdf_z_sign"):
+        YAMLeaderConfig(gravity_urdf_z_sign=2)
+
+
 def test_normalized_joint_mapping_uses_yam_ranges():
     q = normalized_to_joint_positions(
         [-100, 100, 0, -100, 100, 0],

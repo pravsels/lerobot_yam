@@ -80,6 +80,11 @@ class YAMLeaderConfig:
     # (the default build pose). Tune with gravity_assist_dry_run if a joint's
     # modeled torque is wrong at a known pose; offsets are usually 0 or ±pi/2.
     gravity_joint_offsets_rad: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    # Which way the URDF's +z axis points physically when the GELLO is
+    # mounted: +1 up, -1 down. The bundled yam_active_gello export is z-down
+    # (-1) for the standard tabletop mount; with the wrong value every assist
+    # torque is inverted and the arm is pushed toward its fallen pose.
+    gravity_urdf_z_sign: int = -1
     # Compute and log assist currents without configuring motors or applying
     # any torque. Use this first on new hardware to verify signs/offsets.
     gravity_assist_dry_run: bool = False
@@ -127,6 +132,8 @@ class YAMLeaderConfig:
             raise ValueError("gravity_joint_offsets_rad must contain six values")
         if any(not math.isfinite(float(o)) for o in self.gravity_joint_offsets_rad):
             raise ValueError("gravity_joint_offsets_rad values must be finite")
+        if int(self.gravity_urdf_z_sign) not in {-1, 1}:
+            raise ValueError("gravity_urdf_z_sign must be -1 or 1")
         if not 35 <= self.assist_temperature_limit_c <= 60:
             raise ValueError("assist_temperature_limit_c must be in [35, 60]")
         if not 100 <= self.assist_bus_watchdog_ms <= 1000:

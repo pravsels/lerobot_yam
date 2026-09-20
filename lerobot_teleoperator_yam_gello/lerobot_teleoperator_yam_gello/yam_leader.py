@@ -344,7 +344,9 @@ class YAMLeader(Teleoperator):
         watchdog_raw = self._watchdog_raw()
 
         if self.config.gravity_assist:
-            self._gravity_model = GelloGravityModel()
+            self._gravity_model = GelloGravityModel(
+                gravity_z_sign=self.config.gravity_urdf_z_sign
+            )
         if self.config.gravity_assist and not live_gravity:
             logger.warning(
                 "GELLO gravity assist DRY RUN on %s: computing and logging "
