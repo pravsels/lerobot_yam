@@ -663,12 +663,29 @@ def _capture_apex(session: SysidSession, leader: YAMLeader, args) -> int:
     )
     print(
         f"apex offset for {args.joint}: {solution.offset_apex_rad:+.4f} rad "
-        f"(hanging alternative {solution.offset_hanging_rad:+.4f}; "
-        f"gravity amplitude {solution.amplitude_nm:.4f} Nm ≈ {amp_ma} mA)"
+        f"(gravity amplitude {solution.amplitude_nm:.4f} Nm ≈ {amp_ma} mA)"
+    )
+    print(
+        f"  [the other zero, {solution.offset_hanging_rad:+.4f}, is the "
+        "upside-down/hanging solution — DO NOT USE: it pushes with gravity]"
     )
     print(
         "suggested --teleop.gravity-joint-offsets="
         + ",".join(f"{v:.4f}" for v in new_offsets)
+    )
+    ranges_csv = ",".join(
+        f"{v:g}" for pair in leader.config.gravity_joint_ranges_rad for v in pair
+    )
+    print(
+        f"  [valid ONLY together with --ranges={ranges_csv} — offsets and "
+        "ranges are captured as a set]"
+    )
+    print(
+        "  [offsets COMPOUND down the chain: a proximal offset rotates every "
+        "joint after it. Capture tip-to-base (wrist_flex -> elbow_flex -> "
+        "shoulder_lift), passing each result via --offsets. If a proximal "
+        "offset later changes by d, subtract d from the next joint's offset "
+        "so the sums stay fixed.]"
     )
     payload = {
         "timestamp": datetime.now().isoformat(timespec="seconds"),
@@ -680,6 +697,7 @@ def _capture_apex(session: SysidSession, leader: YAMLeader, args) -> int:
         "amplitude_nm": solution.amplitude_nm,
         "amplitude_ma": amp_ma,
         "signs": list(leader.config.gravity_joint_signs),
+        "ranges_rad": [list(p) for p in leader.config.gravity_joint_ranges_rad],
         "prior_offsets_rad": list(leader.config.gravity_joint_offsets_rad),
         "suggested_offsets_rad": [float(v) for v in new_offsets],
     }
