@@ -433,10 +433,17 @@ class YAMLeader(Teleoperator):
 
     def _gripper_open_tick(self) -> int:
         calibration = self.calibration["gripper"]
-        # The YAM squeeze trigger is assembled so its physical open/rest pose
-        # is the high-tick endpoint. Its spring must push toward that endpoint;
-        # the operator squeezes toward low ticks to close.
-        return int(calibration.range_max)
+        # The YAM squeeze trigger's physical open/rest pose is the high-tick
+        # endpoint on a standard build; the operator squeezes toward low ticks
+        # to close. A mirrored build (e.g. the right leader of a bimanual DK1
+        # pair) reverses the tick direction — mark its calibration with
+        # drive_mode=1, which flips both LeRobot's normalization (teleop
+        # squeeze direction) and this spring target consistently.
+        return (
+            int(calibration.range_min)
+            if calibration.drive_mode
+            else int(calibration.range_max)
+        )
 
     def _update_assistance(self, action: dict[str, float]) -> None:
         now = time.monotonic()

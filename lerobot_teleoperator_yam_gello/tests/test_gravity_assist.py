@@ -229,7 +229,9 @@ def test_tick_wrap_chooses_equivalent_nearest_calibration():
 
 @pytest.mark.parametrize(
     ("drive_mode", "expected_open_tick"),
-    [(0, 1000), (1, 1000)],
+    # Standard build: open at the high-tick endpoint. Mirrored build (e.g. the
+    # right leader of a bimanual pair, drive_mode=1): open at the low end.
+    [(0, 1000), (1, 100)],
 )
 def test_gripper_return_targets_physical_open_endpoint(
     drive_mode, expected_open_tick
