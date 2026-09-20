@@ -55,6 +55,7 @@ from .gravity_assist import (
 from .gravity_sysid_fit import (
     apply_offset_delta,
     balance_and_friction,
+    fit_edge_events,
     fit_sine,
     suggest_corrections,
 )
@@ -69,7 +70,20 @@ class Probe:
     current_ma: int
     delta_ticks: float
     motion: int  # -1 falls, 0 holds, +1 drives
+    theta_urdf: float  # test joint's URDF angle at this probe's start
     gravity_model_nm: float
+    model_balance_ma: float
+
+
+@dataclass
+class EdgeEvent:
+    """One holding-interval edge at its own angle (the joint drifts between probes)."""
+
+    theta_urdf: float
+    current_ma: float
+    direction: int  # -1 lower edge (falling boundary), +1 upper edge (driving)
+    model_balance_ma: float
+    pose_index: int
 
 
 @dataclass
@@ -88,6 +102,7 @@ class PoseRecord:
     travel_exceeded: bool = False
     quasistatic_violation: str | None = None
     probes: list[Probe] = field(default_factory=list)
+    edge_events: list["EdgeEvent"] = field(default_factory=list)
 
     @property
     def usable(self) -> bool:
@@ -109,23 +124,36 @@ class SysidSession:
         self.sign = int(leader.config.gravity_joint_signs[self.joint_index])
         self.locked = [name for name in ARM_JOINT_NAMES if name != self.joint]
         self.records: list[PoseRecord] = []
-        # Effective caps: never exceed what the motor's EEPROM allows.
-        self.test_cap = self._effective_cap(self.joint, args.test_current_limit_ma)
+        self.edge_events: list[EdgeEvent] = []
+        # The gravity-assist runs write low Current_Limit values into EEPROM
+        # (e.g. 200 mA), which would clamp both the locks and the sweep. Raise
+        # the limits for this session and restore the originals afterwards.
+        # Torque is still off here (leader.connect leaves it off).
+        self._original_current_limits: dict[str, int] = {}
+        self.test_cap = self._ensure_current_limit(self.joint, args.test_current_limit_ma)
         self.lock_caps = {
-            name: self._effective_cap(name, args.lock_current_ma) for name in self.locked
+            name: self._ensure_current_limit(name, args.lock_current_ma)
+            for name in self.locked
         }
 
     # -- hardware helpers ----------------------------------------------------
 
-    def _effective_cap(self, motor: str, requested: int) -> int:
-        hardware = int(self.bus.read("Current_Limit", motor))
-        cap = min(int(requested), hardware)
-        if cap < requested:
-            print(
-                f"  note: {motor} EEPROM Current_Limit={hardware} mA clamps the "
-                f"requested {requested} mA"
-            )
-        return cap
+    def _ensure_current_limit(self, motor: str, requested: int) -> int:
+        requested = min(int(requested), 1000)  # well under the XL330's 1750 max
+        existing = int(self.bus.read("Current_Limit", motor))
+        self._original_current_limits[motor] = existing
+        if existing < requested:
+            print(f"  {motor}: raising Current_Limit {existing} -> {requested} mA for this session")
+            self.bus.write("Current_Limit", motor, requested, normalize=False)
+        return requested
+
+    def restore_current_limits(self) -> None:
+        for motor, original in self._original_current_limits.items():
+            try:
+                if int(self.bus.read("Current_Limit", motor)) != original:
+                    self.bus.write("Current_Limit", motor, original, normalize=False)
+            except Exception:  # noqa: BLE001 - best effort on teardown
+                print(f"  warning: failed to restore Current_Limit on {motor}")
 
     def arm_state(self) -> tuple[dict[str, int], np.ndarray, np.ndarray]:
         ticks = self.leader._read_raw_ticks()
@@ -171,6 +199,7 @@ class SysidSession:
                 self.bus.write("Goal_Current", name, 0, normalize=False, num_retry=2)
         finally:
             self.leader.configure()  # torque off, POSITION mode everywhere
+            self.restore_current_limits()
 
     def check_temperature(self) -> int:
         temperature = int(self.bus.read("Present_Temperature", self.joint))
@@ -187,15 +216,20 @@ class SysidSession:
         current = int(round(np.clip(current_ma, -self.test_cap, self.test_cap)))
         self.bus.write("Goal_Current", self.joint, current, normalize=False)
         time.sleep(self.args.probe_settle_s)
-        before = self.leader._read_raw_ticks()
-        _, _, q_urdf = self.arm_state()
+        before, _, q_urdf = self.arm_state()
+        theta = float(q_urdf[self.joint_index])
         gravity_nm = float(self.model.gravity_torques(q_urdf)[self.joint_index])
+        model_ma = float(
+            torque_to_current_ma(
+                gravity_nm * self.sign, self.bus.motors[self.joint].model, _UNCLIPPED_MA
+            )
+        )
         time.sleep(self.args.dwell_s)
         after = self.leader._read_raw_ticks()
 
         delta = float(after[self.joint] - before[self.joint])
         motion = 0 if abs(delta) < MOTION_THRESHOLD_TICKS else (1 if delta > 0 else -1)
-        probe = Probe(current, delta, motion, gravity_nm)
+        probe = Probe(current, delta, motion, theta, gravity_nm, model_ma)
         record.probes.append(probe)
 
         # Quasistatic check: locked joints must not move within one window.
@@ -228,13 +262,19 @@ class SysidSession:
         return exceeded
 
     def bracket_edges(self, record: PoseRecord) -> None:
-        """Find currents producing both motion directions, then bisect both edges."""
+        """Find both motion directions if possible, then bisect each found edge.
+
+        Any single edge is a usable data point (an `EdgeEvent` at its own
+        angle), so a pose that only yields one boundary still contributes.
+        """
         center = float(np.clip(record.model_balance_ma,
                                -self.args.initial_center_cap_ma,
                                self.args.initial_center_cap_ma))
         self.probe(record, center)
         radius = 24.0
         while not self._has_both_motions(record) and not self.travel_exceeded(record):
+            if len(record.probes) >= self.args.max_probes_per_pose:
+                break
             for offset in (radius, -radius):
                 self.probe(record, center + offset)
                 if self._has_both_motions(record) or self.travel_exceeded(record):
@@ -246,34 +286,42 @@ class SysidSession:
         motions = {p.motion for p in record.probes}
         if -1 not in motions or 1 not in motions:
             print(
-                "    could not bracket both edges within the current cap "
-                f"({self.test_cap} mA) — joint too heavy for the motor here, or "
-                "already saturated; recorded probes kept for diagnostics"
+                "    only one motion direction seen within the cap "
+                f"({self.test_cap} mA); keeping whatever edge is available"
             )
-            return
 
         low = self._bisect(record, moving=-1)
         high = self._bisect(record, moving=+1)
-        if low is None or high is None or record.travel_exceeded:
-            return
-        record.edge_low_ma, record.edge_high_ma = float(low), float(high)
-        if record.edge_high_ma < record.edge_low_ma:
-            record.edge_low_ma, record.edge_high_ma = record.edge_high_ma, record.edge_low_ma
-        record.balance_ma, record.friction_ma = balance_and_friction(
-            record.edge_low_ma, record.edge_high_ma
-        )
-        print(
-            f"    edges [{record.edge_low_ma:+.0f}, {record.edge_high_ma:+.0f}] mA -> "
-            f"balance {record.balance_ma:+.0f} mA, friction ±{record.friction_ma:.0f} mA "
-            f"(model said {record.model_balance_ma:+.0f} mA)"
-        )
+        for edge_probe, direction in ((low, -1), (high, +1)):
+            if edge_probe is None:
+                continue
+            event = EdgeEvent(
+                theta_urdf=edge_probe.theta_urdf,
+                current_ma=float(edge_probe.current_ma),
+                direction=direction,
+                model_balance_ma=edge_probe.model_balance_ma,
+                pose_index=record.pose_index,
+            )
+            self.edge_events.append(event)
+            record.edge_events.append(event)
+        if low is not None and high is not None:
+            record.edge_low_ma = float(min(low.current_ma, high.current_ma))
+            record.edge_high_ma = float(max(low.current_ma, high.current_ma))
+            record.balance_ma, record.friction_ma = balance_and_friction(
+                record.edge_low_ma, record.edge_high_ma
+            )
+            print(
+                f"    edges [{record.edge_low_ma:+.0f}, {record.edge_high_ma:+.0f}] mA -> "
+                f"balance {record.balance_ma:+.0f} mA, friction ±{record.friction_ma:.0f} mA "
+                f"(model said {record.model_balance_ma:+.0f} mA)"
+            )
 
     def _has_both_motions(self, record: PoseRecord) -> bool:
         motions = {p.motion for p in record.probes}
         return -1 in motions and 1 in motions
 
-    def _bisect(self, record: PoseRecord, moving: int) -> float | None:
-        """Boundary between `moving` and holding; returns the holding-side current."""
+    def _bisect(self, record: PoseRecord, moving: int) -> Probe | None:
+        """Boundary between `moving` and holding; returns the holding-side probe."""
         movers = [p for p in record.probes if p.motion == moving]
         stills = [p for p in record.probes if p.motion != moving]
         if not movers or not stills:
@@ -294,7 +342,7 @@ class SysidSession:
             low = edge.current_ma
 
         while high - low > self.args.current_tolerance_ma:
-            if self.travel_exceeded(record):
+            if self.travel_exceeded(record) or len(record.probes) >= self.args.max_probes_per_pose:
                 break
             middle = 0.5 * (low + high)
             probe = self.probe(record, middle)
@@ -309,7 +357,7 @@ class SysidSession:
                     high = probe.current_ma
                 else:
                     low = probe.current_ma
-        return float(edge.current_ma)
+        return edge
 
     # -- session -------------------------------------------------------------
 
@@ -317,7 +365,8 @@ class SysidSession:
         print(
             f"\nPose {pose_index + 1}/{self.args.poses}: move ONLY the "
             f"{self.joint} joint to a new angle (other joints are locked), "
-            "then press ENTER."
+            "then press ENTER. Keep the arm CLEAR of the table — any contact "
+            "invalidates the measurement."
         )
         self._wait_for_enter_with_live_display()
         ticks, q_yam, q_urdf = self.arm_state()
@@ -364,8 +413,29 @@ class SysidSession:
                 print()
                 return
 
+    def _contact_suspects(self) -> list[str]:
+        """Holds spanning a very wide current range at ~the same angle suggest the
+        arm was resting on something (table): friction alone rarely exceeds this."""
+        suspects = []
+        for record in self.records:
+            holds = [p for p in record.probes if p.motion == 0]
+            for i, first in enumerate(holds):
+                for second in holds[i + 1:]:
+                    same_angle = abs(first.theta_urdf - second.theta_urdf) < 0.02
+                    if same_angle and abs(first.current_ma - second.current_ma) > 140:
+                        suspects.append(
+                            f"pose {record.pose_index}: holds at both "
+                            f"{first.current_ma:+d} and {second.current_ma:+d} mA at "
+                            f"theta {first.theta_urdf:+.3f} — external support (table?) "
+                            "or extreme stiction; treat this pose as suspect"
+                        )
+                        break
+                else:
+                    continue
+                break
+        return suspects
+
     def report(self) -> dict:
-        usable = [r for r in self.records if r.usable]
         payload: dict = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
             "joint": self.joint,
@@ -379,37 +449,48 @@ class SysidSession:
                 "ranges_rad": [list(p) for p in self.leader.config.gravity_joint_ranges_rad],
                 "test_cap_ma": self.test_cap,
                 "lock_caps_ma": self.lock_caps,
+                "original_current_limits_ma": self._original_current_limits,
             },
             "model_link_masses_kg": self.model.link_masses,
             "poses": [asdict(r) for r in self.records],
-            "usable_poses": len(usable),
+            "edge_events": [asdict(e) for e in self.edge_events],
         }
-        print(f"\n{'=' * 60}\n{self.joint}: {len(usable)} usable poses of {len(self.records)}")
-        for r in self.records:
-            status = "ok" if r.usable else "UNUSABLE"
-            balance = f"{r.balance_ma:+.0f}" if r.balance_ma is not None else "  —"
-            friction = f"±{r.friction_ma:.0f}" if r.friction_ma is not None else ""
+        print(
+            f"\n{'=' * 60}\n{self.joint}: {len(self.edge_events)} edge events "
+            f"from {len(self.records)} poses"
+        )
+        for event in self.edge_events:
+            kind = "lower(-)" if event.direction < 0 else "upper(+)"
             print(
-                f"  pose {r.pose_index}: q={r.q_urdf[self.joint_index]:+.3f} rad  "
-                f"measured {balance} {friction} mA  model {r.model_balance_ma:+.0f} mA  "
-                f"[{status}]"
+                f"  pose {event.pose_index} {kind}: theta={event.theta_urdf:+.3f} rad  "
+                f"I={event.current_ma:+.0f} mA  model {event.model_balance_ma:+.0f} mA"
             )
-        if len(usable) < 3:
-            print("\nNeed >= 3 usable poses for a fit. Collect more (spread the angles).")
+        contact = self._contact_suspects()
+        payload["contact_suspects"] = contact
+        for suspect in contact:
+            print(f"WARNING: {suspect}")
+
+        directions = [e.direction for e in self.edge_events]
+        if len(self.edge_events) < 4 or not (
+            any(d > 0 for d in directions) and any(d < 0 for d in directions)
+        ):
+            print(
+                "\nNot enough edge events for a fit (need >= 4 with both "
+                "directions). Collect more poses."
+            )
             return payload
 
-        theta = [r.q_urdf[self.joint_index] for r in usable]
-        measured_fit = fit_sine(theta, [r.balance_ma for r in usable])
-        model_fit = fit_sine(theta, [r.model_balance_ma for r in usable])
-        corrections = suggest_corrections(measured_fit, model_fit)
-        payload["measured_fit"] = asdict(measured_fit)
+        theta = [e.theta_urdf for e in self.edge_events]
+        edge_fit = fit_edge_events(theta, [e.current_ma for e in self.edge_events], directions)
+        model_fit = fit_sine(theta, [e.model_balance_ma for e in self.edge_events])
+        corrections = suggest_corrections(edge_fit.sine, model_fit)
+        payload["measured_fit"] = asdict(edge_fit.sine)
+        payload["measured_friction_ma"] = edge_fit.friction_ma
         payload["model_fit"] = asdict(model_fit)
         payload["corrections"] = asdict(corrections)
 
-        print(f"\nmeasured: {measured_fit.describe()}")
+        print(f"\nmeasured: {edge_fit.sine.describe()}  friction ±{edge_fit.friction_ma:.0f} mA")
         print(f"model:    {model_fit.describe()}")
-        mean_friction = float(np.mean([r.friction_ma for r in usable]))
-        print(f"friction: ±{mean_friction:.0f} mA mean stiction half-width")
         for warning in corrections.warnings:
             print(f"WARNING: {warning}")
 
@@ -514,7 +595,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--masses", type=_csv(float, 7, "--masses"), default=())
     parser.add_argument("--z-sign", type=int, choices=(1, -1), default=-1)
     parser.add_argument("--test-current-limit-ma", type=int, default=250)
-    parser.add_argument("--lock-current-ma", type=int, default=250)
+    parser.add_argument(
+        "--lock-current-ma",
+        type=int,
+        default=600,
+        help="Lock strength for the non-test joints; the shoulder needs real "
+        "torque to stay put while the elbow is probed (default 600)",
+    )
+    parser.add_argument("--max-probes-per-pose", type=int, default=30)
     parser.add_argument("--current-tolerance-ma", type=float, default=4.0)
     parser.add_argument("--initial-center-cap-ma", type=float, default=150.0)
     parser.add_argument("--dwell-s", type=float, default=0.3)

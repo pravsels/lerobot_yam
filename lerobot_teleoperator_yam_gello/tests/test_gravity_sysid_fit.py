@@ -90,3 +90,35 @@ def test_apply_offset_delta_touches_only_the_target_joint_and_wraps():
 def test_fit_requires_three_poses():
     with pytest.raises(ValueError, match="3 poses"):
         fit_sine([0.0, 1.0], [1.0, 2.0])
+
+
+def test_edge_event_fit_recovers_curve_and_friction_despite_drift():
+    """Per-event fit tolerates the joint drifting between probes: every edge
+    carries its own angle, unlike a per-pose balance midpoint."""
+    from lerobot_teleoperator_yam_gello.gravity_sysid_fit import fit_edge_events
+
+    amplitude, phase, intercept, friction = 110.0, 0.35, -6.0, 42.0
+    theta, currents, directions = [], [], []
+    for t in np.linspace(-0.9, 1.4, 6):
+        for d in (-1, 1):
+            # Edges observed at slightly different angles (drift during probing).
+            t_edge = t + (0.03 if d > 0 else -0.02)
+            theta.append(t_edge)
+            currents.append(
+                amplitude * math.sin(t_edge + phase) + intercept + friction * d
+            )
+            directions.append(d)
+
+    fit = fit_edge_events(theta, currents, directions)
+
+    assert fit.sine.amplitude == pytest.approx(amplitude, abs=1e-6)
+    assert fit.sine.phase_rad == pytest.approx(phase, abs=1e-6)
+    assert fit.sine.intercept == pytest.approx(intercept, abs=1e-6)
+    assert fit.friction_ma == pytest.approx(friction, abs=1e-6)
+
+
+def test_edge_event_fit_requires_both_directions():
+    from lerobot_teleoperator_yam_gello.gravity_sysid_fit import fit_edge_events
+
+    with pytest.raises(ValueError, match="both directions"):
+        fit_edge_events([0.0, 0.5, 1.0, 1.5], [10, 20, 30, 40], [1, 1, 1, 1])

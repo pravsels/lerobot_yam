@@ -98,6 +98,53 @@ def fit_sine(theta_rad: Sequence[float], values: Sequence[float]) -> SineFit:
     )
 
 
+@dataclass(frozen=True)
+class EdgeFit:
+    """Sine fit plus stiction fitted directly from breakaway-edge events.
+
+    Each event is one edge of the holding interval observed at its *own* angle
+    (`I_edge = A*sin(theta+phi) + c + friction*d`, d = -1 lower / +1 upper), so
+    the joint is allowed to drift between probes — the same per-event trick as
+    `torque_identification.py` on `feat/pwm-control-so101`. This matters on the
+    GELLO: every fall/drive probe moves the joint, so a fixed-pose balance
+    midpoint chases a moving target while edge events stay exact.
+    """
+
+    sine: SineFit
+    friction_ma: float
+
+
+def fit_edge_events(
+    theta_rad: Sequence[float],
+    edge_current_ma: Sequence[float],
+    directions: Sequence[int],
+) -> EdgeFit:
+    theta = np.asarray(theta_rad, dtype=np.float64)
+    current = np.asarray(edge_current_ma, dtype=np.float64)
+    d = np.asarray(directions, dtype=np.float64)
+    if not (theta.shape == current.shape == d.shape) or theta.ndim != 1:
+        raise ValueError("theta, currents, and directions must be equal-length 1D")
+    if theta.size < 4:
+        raise ValueError("need at least 4 edge events to fit A, phase, intercept, friction")
+    if not (np.any(d > 0) and np.any(d < 0)):
+        raise ValueError("need edge events from both directions to separate friction")
+    design = np.column_stack([np.sin(theta), np.cos(theta), np.ones_like(theta), d])
+    coeffs, _, _, singular = np.linalg.lstsq(design, current, rcond=None)
+    a, b, c, friction = (float(v) for v in coeffs)
+    residual = current - design @ coeffs
+    rms = float(np.sqrt(np.mean(residual**2)))
+    condition = float(singular[0] / singular[-1]) if singular[-1] > 0 else float("inf")
+    sine = SineFit(
+        amplitude=math.hypot(a, b),
+        phase_rad=math.atan2(b, a),
+        intercept=c,
+        rms_residual=rms,
+        condition_number=condition,
+        n_points=int(theta.size),
+    )
+    return EdgeFit(sine=sine, friction_ma=friction)
+
+
 def wrap_angle(angle_rad: float) -> float:
     return math.atan2(math.sin(angle_rad), math.cos(angle_rad))
 
