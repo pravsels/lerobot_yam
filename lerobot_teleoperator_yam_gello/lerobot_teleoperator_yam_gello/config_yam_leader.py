@@ -5,6 +5,7 @@ The YAM leader uses Dynamixel XL330 servos for position sensing.
 It reads joint positions and outputs normalized values for the follower.
 """
 
+import math
 from dataclasses import dataclass, field
 
 from lerobot.motors import Motor, MotorNormMode
@@ -74,6 +75,14 @@ class YAMLeaderConfig:
     # Motor direction relative to the active-GELLO URDF. These are the FACTR
     # YAM defaults; override them if a GELLO was assembled with a reversed horn.
     gravity_joint_signs: tuple[int, ...] = (1, -1, -1, -1, 1, 1)
+    # Radians added per joint after the sign flip: q_urdf = sign * q_yam + offset.
+    # Zero assumes the GELLO's URDF home coincides with the YAM zero pose
+    # (the default build pose). Tune with gravity_assist_dry_run if a joint's
+    # modeled torque is wrong at a known pose; offsets are usually 0 or ±pi/2.
+    gravity_joint_offsets_rad: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    # Compute and log assist currents without configuring motors or applying
+    # any torque. Use this first on new hardware to verify signs/offsets.
+    gravity_assist_dry_run: bool = False
 
     # A current-limited position spring holds the squeeze trigger open while
     # remaining easy to press and hold. This can be used without arm gravity
@@ -114,6 +123,10 @@ class YAMLeaderConfig:
             raise ValueError("gravity_joint_signs must contain six values")
         if any(int(sign) not in {-1, 1} for sign in self.gravity_joint_signs):
             raise ValueError("gravity_joint_signs values must be -1 or 1")
+        if len(self.gravity_joint_offsets_rad) != len(ARM_JOINT_NAMES):
+            raise ValueError("gravity_joint_offsets_rad must contain six values")
+        if any(not math.isfinite(float(o)) for o in self.gravity_joint_offsets_rad):
+            raise ValueError("gravity_joint_offsets_rad values must be finite")
         if not 35 <= self.assist_temperature_limit_c <= 60:
             raise ValueError("assist_temperature_limit_c must be in [35, 60]")
         if not 100 <= self.assist_bus_watchdog_ms <= 1000:

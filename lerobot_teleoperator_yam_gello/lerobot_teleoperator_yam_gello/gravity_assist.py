@@ -53,6 +53,27 @@ def normalized_to_joint_positions(
     return lows + ((bounded + 100.0) / 200.0) * (highs - lows)
 
 
+def gello_joint_positions(
+    normalized: Sequence[float],
+    ranges_rad: Sequence[tuple[float, float]],
+    signs: Sequence[int],
+    offsets_rad: Sequence[float],
+) -> np.ndarray:
+    """Map normalized leader values into the GELLO URDF's joint coordinates.
+
+    Signs and offsets are applied in *radian* space: ``q_urdf = s*q_yam + o``.
+    Applying a sign to the normalized value instead would mirror the joint
+    about its calibration midpoint — a different (wrong) pose whenever the
+    joint range is asymmetric, which all the YAM lift joints are.
+    """
+    q_yam = normalized_to_joint_positions(normalized, ranges_rad)
+    signs_arr = np.asarray(signs, dtype=np.float64)
+    offsets_arr = np.asarray(offsets_rad, dtype=np.float64)
+    if signs_arr.shape != (6,) or offsets_arr.shape != (6,):
+        raise ValueError("gravity model requires six signs and six offsets")
+    return signs_arr * q_yam + offsets_arr
+
+
 @dataclass(frozen=True)
 class _LinkInertia:
     mass: float

@@ -70,9 +70,13 @@ Safety measures:
 - disconnect writes zero current and disables torque.
 
 FACTR's YAM motor directions are the defaults:
-`[1, -1, -1, -1, 1, 1]`. If any joint assists gravity in the wrong direction,
-stop immediately and override `gravity_joint_signs` before retrying. Never
-raise gain to compensate for a wrong sign.
+`[1, -1, -1, -1, 1, 1]`. Signs and `gravity_joint_offsets_rad` are applied in
+radian space (`q_urdf = sign * q_yam + offset`); offsets are usually 0 or
+±pi/2 depending on assembly. Validate both with `gravity_assist_dry_run=true`
+first: it logs the modeled joint positions, torques, and currents once a
+second while applying no torque. If any joint assists gravity in the wrong
+direction, stop and fix its sign/offset before retrying. Never raise gain to
+compensate for a wrong sign.
 
 Note: this repo expects `lerobot` 0.4.3 features (plugin discovery in the
 standard CLIs). If 0.4.3 is not on PyPI, install it from

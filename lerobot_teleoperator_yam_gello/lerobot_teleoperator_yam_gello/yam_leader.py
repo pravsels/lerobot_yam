@@ -21,7 +21,7 @@ from lerobot.teleoperators.teleoperator import Teleoperator
 from .config_yam_leader import ARM_JOINT_NAMES, YAMLeaderTeleopConfig
 from .gravity_assist import (
     GelloGravityModel,
-    normalized_to_joint_positions,
+    gello_joint_positions,
     torque_to_current_ma,
 )
 
@@ -70,7 +70,10 @@ class YAMLeader(Teleoperator):
         self._assist_faulted = False
         self._last_assist_q: np.ndarray | None = None
         self._last_assist_time: float | None = None
+        self._assist_velocity = np.zeros(len(ARM_JOINT_NAMES), dtype=np.float64)
+        self._live_assist_motors: list[str] = []
         self._last_health_check_time = 0.0
+        self._last_dry_run_log_time = 0.0
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -330,15 +333,25 @@ class YAMLeader(Teleoperator):
             raise RuntimeError("GELLO assistance requires a leader calibration")
 
         arm_motors = list(ARM_JOINT_NAMES)
-        assisted_motors = arm_motors if self.config.gravity_assist else []
+        live_gravity = (
+            self.config.gravity_assist and not self.config.gravity_assist_dry_run
+        )
+        assisted_motors = arm_motors if live_gravity else []
         if self.config.gripper_return:
             assisted_motors.append("gripper")
 
         self.bus.disable_torque(assisted_motors)
-        watchdog_raw = max(1, int(math.ceil(self.config.assist_bus_watchdog_ms / 20.0)))
+        watchdog_raw = self._watchdog_raw()
 
         if self.config.gravity_assist:
             self._gravity_model = GelloGravityModel()
+        if self.config.gravity_assist and not live_gravity:
+            logger.warning(
+                "GELLO gravity assist DRY RUN on %s: computing and logging "
+                "currents, applying no torque to the arm joints",
+                self.config.port,
+            )
+        if live_gravity:
             for motor in arm_motors:
                 self._set_current_limit_if_needed(
                     motor, self.config.gravity_assist_current_limit_ma
@@ -348,6 +361,7 @@ class YAMLeader(Teleoperator):
                 self.bus.write("Goal_Current", motor, 0, normalize=False)
 
         if self.config.gripper_return:
+            open_tick = self._gripper_open_tick()
             self._set_current_limit_if_needed(
                 "gripper", self.config.gripper_return_current_ma
             )
@@ -364,15 +378,27 @@ class YAMLeader(Teleoperator):
             self.bus.write(
                 "Goal_Position",
                 "gripper",
-                self._gripper_open_tick(),
+                open_tick,
                 normalize=False,
+            )
+            calibration = self.calibration["gripper"]
+            logger.warning(
+                "GELLO gripper return target: port=%s open_tick=%d "
+                "calibration=[%d,%d] current_limit=%dmA",
+                self.config.port,
+                open_tick,
+                calibration.range_min,
+                calibration.range_max,
+                self.config.gripper_return_current_ma,
             )
 
         self.bus.enable_torque(assisted_motors)
+        self._live_assist_motors = list(assisted_motors)
         self._assist_enabled = True
         self._assist_faulted = False
         self._last_assist_q = None
         self._last_assist_time = None
+        self._assist_velocity[:] = 0.0
         self._last_health_check_time = time.monotonic()
         logger.warning(
             "GELLO active assistance enabled on %s: gravity=%s (gain=%.3f, "
@@ -385,6 +411,9 @@ class YAMLeader(Teleoperator):
             self.config.gripper_return_current_ma,
             self.config.assist_bus_watchdog_ms,
         )
+
+    def _watchdog_raw(self) -> int:
+        return max(1, int(math.ceil(self.config.assist_bus_watchdog_ms / 20.0)))
 
     def _set_current_limit_if_needed(self, motor: str, limit_ma: int) -> None:
         existing = int(self.bus.read("Current_Limit", motor))
@@ -409,48 +438,79 @@ class YAMLeader(Teleoperator):
 
             if not self.config.gravity_assist:
                 return
+            dry_run = self.config.gravity_assist_dry_run
             normalized = np.asarray(
                 [float(action[f"{name}.pos"]) for name in ARM_JOINT_NAMES],
                 dtype=np.float64,
             )
             if not np.all(np.isfinite(normalized)):
-                self._write_arm_currents({name: 0 for name in ARM_JOINT_NAMES})
+                if not dry_run:
+                    self._write_arm_currents({name: 0 for name in ARM_JOINT_NAMES})
                 self._last_assist_q = None
                 self._last_assist_time = None
+                self._assist_velocity[:] = 0.0
                 return
 
-            signs = np.asarray(self.config.gravity_joint_signs, dtype=np.float64)
-            q = normalized_to_joint_positions(
-                normalized * signs,
+            # URDF-frame joint coordinates: q_urdf = sign * q_yam + offset.
+            # The torque the model returns is therefore also URDF-frame and
+            # must be mapped back through the same signs for the motors.
+            q = gello_joint_positions(
+                normalized,
                 self.config.gravity_joint_ranges_rad,
+                self.config.gravity_joint_signs,
+                self.config.gravity_joint_offsets_rad,
             )
-            velocity = np.zeros(6, dtype=np.float64)
-            if self._last_assist_q is not None and self._last_assist_time is not None:
+            # Low-passed velocity from well-spaced samples only: with 4096
+            # ticks/rev, one tick of read noise over a sub-millisecond dt
+            # would otherwise command large alternating damping currents.
+            if self._last_assist_q is None or self._last_assist_time is None:
+                self._last_assist_q = q
+                self._last_assist_time = now
+            else:
                 dt = now - self._last_assist_time
-                if 1e-4 <= dt <= 0.25:
-                    velocity = np.clip((q - self._last_assist_q) / dt, -10.0, 10.0)
+                if dt > 0.25:
+                    self._assist_velocity[:] = 0.0
+                    self._last_assist_q = q
+                    self._last_assist_time = now
+                elif dt >= 0.005:
+                    raw_velocity = np.clip((q - self._last_assist_q) / dt, -5.0, 5.0)
+                    self._assist_velocity = (
+                        0.7 * self._assist_velocity + 0.3 * raw_velocity
+                    )
+                    self._last_assist_q = q
+                    self._last_assist_time = now
+                # dt < 5 ms: keep the previous sample; too noisy to difference.
 
             if self._gravity_model is None:
                 raise RuntimeError("gravity model was not initialized")
-            torque_nm = (
+            torque_urdf = (
                 self.config.gravity_assist_gain
                 * self._gravity_model.gravity_torques(q)
-                - self.config.gravity_assist_damping_nm_per_rad_s * velocity
+                - self.config.gravity_assist_damping_nm_per_rad_s
+                * self._assist_velocity
             )
             currents: dict[str, int] = {}
             for index, name in enumerate(ARM_JOINT_NAMES):
-                motor_model = self.bus.motors[name].model
-                signed_torque = float(torque_nm[index]) * int(
+                motor_torque = float(torque_urdf[index]) * int(
                     self.config.gravity_joint_signs[index]
                 )
                 currents[name] = torque_to_current_ma(
-                    signed_torque,
-                    motor_model,
+                    motor_torque,
+                    self.bus.motors[name].model,
                     self.config.gravity_assist_current_limit_ma,
                 )
+            if dry_run:
+                if now - self._last_dry_run_log_time >= 1.0:
+                    self._last_dry_run_log_time = now
+                    logger.info(
+                        "GELLO gravity DRY RUN %s: q_urdf=%s tau_urdf=%s currents_ma=%s",
+                        self.config.port,
+                        [round(float(v), 3) for v in q],
+                        [round(float(v), 4) for v in torque_urdf],
+                        [currents[name] for name in ARM_JOINT_NAMES],
+                    )
+                return
             self._write_arm_currents(currents)
-            self._last_assist_q = q
-            self._last_assist_time = now
         except Exception as exc:
             self._latch_assist_fault(exc)
 
@@ -478,6 +538,47 @@ class YAMLeader(Teleoperator):
         failed = {name: int(value) for name, value in errors.items() if int(value)}
         if failed:
             raise RuntimeError(f"GELLO hardware error status: {failed}")
+        self._rearm_tripped_watchdogs()
+
+    def _rearm_tripped_watchdogs(self) -> None:
+        """Recover motors whose bus watchdog fired during a stall.
+
+        Any pause in the teleop loop longer than the watchdog window (a
+        websocket reconnect, a calibration prompt) trips the DYNAMIXEL bus
+        watchdog. A tripped motor stops output and makes its Goal registers
+        read-only, and our fast Goal_Current sync writes do not read status
+        packets — so without this, assistance silently stays dead for the
+        rest of the session.
+        """
+        if not self._live_assist_motors:
+            return
+        statuses = self.bus.sync_read(
+            "Bus_Watchdog", self._live_assist_motors, normalize=False
+        )
+        # A tripped watchdog reads -1, i.e. 255 in the unsigned byte register.
+        tripped = [name for name, value in statuses.items() if int(value) > 127]
+        if not tripped:
+            return
+        logger.warning(
+            "GELLO bus watchdog tripped on %s (loop stalled); re-arming assistance",
+            tripped,
+        )
+        watchdog_raw = self._watchdog_raw()
+        for name in tripped:
+            # Writing 0 clears the error state; then re-arm the window.
+            self.bus.write("Bus_Watchdog", name, 0, normalize=False)
+            self.bus.write("Bus_Watchdog", name, watchdog_raw, normalize=False)
+        if "gripper" in tripped and self.config.gripper_return:
+            # The trip cleared the gripper's goal output; restore the spring.
+            self.bus.write(
+                "Goal_Current",
+                "gripper",
+                self.config.gripper_return_current_ma,
+                normalize=False,
+            )
+            self.bus.write(
+                "Goal_Position", "gripper", self._gripper_open_tick(), normalize=False
+            )
 
     def _latch_assist_fault(self, exc: Exception) -> None:
         if self._assist_faulted:
@@ -522,6 +623,7 @@ class YAMLeader(Teleoperator):
                     "failed to restore passive GELLO motor mode", exc_info=True
                 )
         self._assist_enabled = False
+        self._live_assist_motors = []
 
     # =========================================================================
     # Range-safety helpers
