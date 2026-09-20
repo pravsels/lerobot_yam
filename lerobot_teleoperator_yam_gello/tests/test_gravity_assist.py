@@ -97,6 +97,27 @@ def test_tick_wrap_chooses_equivalent_nearest_calibration():
     assert leader._tick_near_calibration("elbow_flex", -6) == -6
 
 
+@pytest.mark.parametrize(
+    ("drive_mode", "expected_open_tick"),
+    [(0, 1000), (1, 1000)],
+)
+def test_gripper_return_targets_physical_open_endpoint(
+    drive_mode, expected_open_tick
+):
+    leader = object.__new__(YAMLeader)
+    leader.calibration = {
+        "gripper": MotorCalibration(
+            id=7,
+            drive_mode=drive_mode,
+            homing_offset=0,
+            range_min=100,
+            range_max=1000,
+        )
+    }
+
+    assert leader._gripper_open_tick() == expected_open_tick
+
+
 def test_enable_assistance_uses_current_modes_limits_watchdog_and_open_target():
     config = YAMLeaderConfig(
         gravity_assist=True,
@@ -134,7 +155,7 @@ def test_enable_assistance_uses_current_modes_limits_watchdog_and_open_target():
         {},
     ) in leader.bus.writes
     assert ("Operating_Mode", "gripper", 5, {}) in leader.bus.writes
-    assert ("Goal_Position", "gripper", 100, {"normalize": False}) in leader.bus.writes
+    assert ("Goal_Position", "gripper", 1000, {"normalize": False}) in leader.bus.writes
     assert (
         "Goal_Current",
         "gripper",

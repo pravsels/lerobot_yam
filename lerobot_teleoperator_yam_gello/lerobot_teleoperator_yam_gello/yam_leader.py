@@ -395,11 +395,10 @@ class YAMLeader(Teleoperator):
 
     def _gripper_open_tick(self) -> int:
         calibration = self.calibration["gripper"]
-        return (
-            int(calibration.range_max)
-            if calibration.drive_mode
-            else int(calibration.range_min)
-        )
+        # The YAM squeeze trigger is assembled so its physical open/rest pose
+        # is the high-tick endpoint. Its spring must push toward that endpoint;
+        # the operator squeezes toward low ticks to close.
+        return int(calibration.range_max)
 
     def _update_assistance(self, action: dict[str, float]) -> None:
         now = time.monotonic()

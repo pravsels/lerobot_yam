@@ -61,8 +61,9 @@ Safety measures:
 
 - per-motor current is hard-clipped (default `250 mA`, configurable up to
   `500 mA`);
-- the squeeze trigger uses current-based position mode and returns to the
-  calibration's `0`/open endpoint (default `100 mA`);
+- the squeeze trigger uses current-based position mode and pushes toward its
+  physical-open/high-tick endpoint (default `100 mA`), so the operator must
+  squeeze and hold it closed;
 - a 200 ms DYNAMIXEL bus watchdog stops output if updates cease;
 - assistance latches off on a motor hardware error, a control exception, or
   temperature reaching 50 °C;
