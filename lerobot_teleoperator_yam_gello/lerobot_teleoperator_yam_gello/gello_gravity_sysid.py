@@ -654,7 +654,15 @@ def _capture_apex(session: SysidSession, leader: YAMLeader, args) -> int:
         solution.amplitude_nm, session.bus.motors[args.joint].model, _UNCLIPPED_MA
     )
     new_offsets = list(leader.config.gravity_joint_offsets_rad)
+    prior = new_offsets[session.joint_index]
     new_offsets[session.joint_index] = solution.offset_apex_rad
+    if session.joint_index + 1 < len(new_offsets):
+        # Offsets compound down the chain; keep the distal absolute angles
+        # exactly where they were calibrated by absorbing this joint's delta.
+        new_offsets[session.joint_index + 1] = wrap_angle(
+            new_offsets[session.joint_index + 1]
+            - (solution.offset_apex_rad - prior)
+        )
     print(f"\ncaptured q_yam: {[round(float(v), 4) for v in q_yam]}")
     print(
         f"(shoulder_lift was {float(q_yam[1]):+.3f} rad — capture again at a "
@@ -663,8 +671,14 @@ def _capture_apex(session: SysidSession, leader: YAMLeader, args) -> int:
     )
     print(
         f"apex offset for {args.joint}: {solution.offset_apex_rad:+.4f} rad "
-        f"(gravity amplitude {solution.amplitude_nm:.4f} Nm ≈ {amp_ma} mA)"
+        f"(own-gravity amplitude {solution.amplitude_nm:.4f} Nm ≈ {amp_ma} mA; "
+        f"pinned distal torque {solution.distal_torque_nm:+.4f} Nm)"
     )
+    if session.joint_index + 1 < len(new_offsets):
+        print(
+            f"  [{ARM_JOINT_NAMES[session.joint_index + 1]} offset co-adjusted "
+            "in the suggested line to keep the calibrated distal angles fixed]"
+        )
     print(
         f"  [the other zero, {solution.offset_hanging_rad:+.4f}, is the "
         "upside-down/hanging solution — DO NOT USE: it pushes with gravity]"

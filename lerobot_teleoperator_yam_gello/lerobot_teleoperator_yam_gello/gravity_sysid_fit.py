@@ -170,6 +170,7 @@ class ApexSolution:
     offset_apex_rad: float
     offset_hanging_rad: float
     amplitude_nm: float
+    distal_torque_nm: float = 0.0
 
 
 def solve_apex_offset(
@@ -178,33 +179,65 @@ def solve_apex_offset(
     signs: Sequence[int],
     offsets_rad: Sequence[float],
     joint_index: int,
+    lock_distal: bool = True,
 ) -> ApexSolution:
     """Offset placing the model's torque zero at the captured apex pose.
 
     `q_yam` is the full six-joint pose (follower radians) captured while the
     operator balances the joint under test at its physical over-center pose.
-    Other joints use their configured signs/offsets.
+
+    Offsets compound down the kinematic chain, so naively scanning this
+    joint's offset would rotate every distal joint too — including ones whose
+    orientation is already calibrated — and the solve would zero the torque on
+    a wrongly-shaped arm. With ``lock_distal`` (default) the next joint's
+    offset is co-varied by the opposite amount so all distal absolute angles
+    stay pinned: the scan then only moves this joint's own contribution and
+    one capture yields its true offset, with the pinned distal torque as a
+    constant. The caller must then keep the composed sums fixed (subtract the
+    found offset delta from the next joint's offset), which
+    ``gello_gravity_sysid --capture-apex`` does automatically.
     """
     q = np.asarray(q_yam, dtype=np.float64)
     signs_arr = np.asarray(signs, dtype=np.float64)
+    base = np.asarray(offsets_rad, dtype=np.float64)
 
     def torque_with(offset: float, q_pose: np.ndarray = q) -> float:
-        offs = np.asarray(offsets_rad, dtype=np.float64).copy()
+        offs = base.copy()
         offs[joint_index] = offset
+        if lock_distal and joint_index + 1 < offs.shape[0]:
+            offs[joint_index + 1] = base[joint_index + 1] - (
+                offset - base[joint_index]
+            )
         q_urdf = signs_arr * q_pose + offs
         return float(model.gravity_torques(q_urdf)[joint_index])
 
-    # tau(o) = tau(0)*cos(o) + tau(pi/2)*sin(o): a sinusoid in the offset.
+    # tau(o) = a*cos(o) + b*sin(o) + d  (d = the pinned distal-chain torque).
     tau_0 = torque_with(0.0)
     tau_90 = torque_with(math.pi / 2.0)
-    amplitude = math.hypot(tau_0, tau_90)
+    tau_180 = torque_with(math.pi)
+    a = (tau_0 - tau_180) / 2.0
+    d = (tau_0 + tau_180) / 2.0
+    b = tau_90 - d
+    amplitude = math.hypot(a, b)
     if amplitude < 1e-4:
         raise ValueError(
             "no gravity signal for this joint at the captured pose; "
             "the distal chain is (modeled as) weightless or aligned with the axis"
         )
-    zero = math.atan2(-tau_0, tau_90)
-    candidates = (wrap_angle(zero), wrap_angle(zero + math.pi))
+    if abs(d) > amplitude:
+        raise ValueError(
+            f"the pinned distal-chain torque ({d:+.4f} Nm) exceeds this "
+            f"joint's own gravity authority ({amplitude:.4f} Nm) at the "
+            "captured pose, so no offset can balance it — the distal offsets "
+            "are likely wrong; recapture joints tip-to-base first"
+        )
+    # a*cos(o) + b*sin(o) = A*sin(o + phi), phi = atan2(a, b); solve = -d.
+    phi = math.atan2(a, b)
+    base_angle = math.asin(max(-1.0, min(1.0, -d / amplitude)))
+    candidates = (
+        wrap_angle(base_angle - phi),
+        wrap_angle(math.pi - base_angle - phi),
+    )
 
     def is_apex(offset: float) -> bool:
         eps = 1e-3
@@ -222,7 +255,10 @@ def solve_apex_offset(
         else (candidates[1], candidates[0])
     )
     return ApexSolution(
-        offset_apex_rad=apex, offset_hanging_rad=hanging, amplitude_nm=amplitude
+        offset_apex_rad=apex,
+        offset_hanging_rad=hanging,
+        amplitude_nm=amplitude,
+        distal_torque_nm=d,
     )
 
 

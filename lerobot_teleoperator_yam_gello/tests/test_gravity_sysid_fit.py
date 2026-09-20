@@ -139,6 +139,18 @@ def test_edge_event_fit_requires_both_directions():
         fit_edge_events([0.0, 0.5, 1.0, 1.5], [10, 20, 30, 40], [1, 1, 1, 1])
 
 
+def _chain_locked_torque(model, signs, offsets, joint, offset, q):
+    """Model torque with the joint's offset set and the next joint co-varied,
+    replicating the chain-locked scan of solve_apex_offset."""
+    offs = list(offsets)
+    delta = offset - offs[joint]
+    offs[joint] = offset
+    if joint + 1 < len(offs):
+        offs[joint + 1] -= delta
+    q_urdf = np.asarray(signs, float) * np.asarray(q, float) + np.asarray(offs)
+    return float(model.gravity_torques(q_urdf)[joint])
+
+
 def test_apex_capture_places_torque_zero_with_unstable_slope():
     from lerobot_teleoperator_yam_gello.gravity_assist import GelloGravityModel
     from lerobot_teleoperator_yam_gello.gravity_sysid_fit import solve_apex_offset
@@ -152,10 +164,7 @@ def test_apex_capture_places_torque_zero_with_unstable_slope():
     solution = solve_apex_offset(model, q_yam, signs, offsets, joint)
 
     def torque_at(offset, q):
-        offs = list(offsets)
-        offs[joint] = offset
-        q_urdf = np.asarray(signs, float) * q + np.asarray(offs)
-        return float(model.gravity_torques(q_urdf)[joint])
+        return _chain_locked_torque(model, signs, offsets, joint, offset, q)
 
     # Zero torque at the captured pose for both candidate offsets...
     assert torque_at(solution.offset_apex_rad, q_yam) == pytest.approx(0.0, abs=1e-3)
@@ -176,6 +185,34 @@ def test_apex_capture_places_torque_zero_with_unstable_slope():
     assert apex_slope < 0
     assert hanging_slope > 0
     assert solution.amplitude_nm > 0.05
+
+
+def test_chain_locked_solve_pins_distal_angles():
+    """Regression from the shoulder-lift fiasco: scanning a proximal offset
+    must not rotate the already-calibrated distal chain. With calibrated
+    distal offsets in the config, the solve zeroes the torque of the
+    co-varied (shape-preserving) configuration."""
+    from lerobot_teleoperator_yam_gello.gravity_assist import GelloGravityModel
+    from lerobot_teleoperator_yam_gello.gravity_sysid_fit import solve_apex_offset
+
+    model = GelloGravityModel()
+    signs = (1, 1, -1, -1, 1, 1)
+    offsets = [0.0, 0.0, 2.70, 0.07, 0.0, 0.0]
+    q_yam = np.array([0.1, 0.63, 1.0, 0.88, -0.04, -0.01])
+    joint = 1  # shoulder_lift
+
+    solution = solve_apex_offset(model, q_yam, signs, offsets, joint)
+
+    locked_zero = _chain_locked_torque(
+        model, signs, offsets, joint, solution.offset_apex_rad, q_yam
+    )
+    assert locked_zero == pytest.approx(0.0, abs=1e-3)
+    # The pinned distal torque is reported so the operator can sanity-check
+    # that the joint's own authority can actually balance it.
+    assert abs(solution.distal_torque_nm) <= solution.amplitude_nm
+    # An unlocked scan would generally land somewhere else entirely.
+    unlocked = solve_apex_offset(model, q_yam, signs, offsets, joint, lock_distal=False)
+    assert unlocked.offset_apex_rad != pytest.approx(solution.offset_apex_rad, abs=0.05)
 
 
 def test_apex_capture_rejects_weightless_distal_chain():
