@@ -338,6 +338,34 @@ def test_live_assist_writes_signed_currents_from_urdf_torque():
     assert any(value != 0 for value in currents.values())
 
 
+def test_single_joint_assist_configures_and_drives_only_that_joint():
+    leader = _bare_leader(
+        YAMLeaderConfig(gravity_assist=True, gravity_assist_joints=("elbow_flex",))
+    )
+
+    leader._enable_assistance()
+
+    mode_writes = [m for (name, m, v, _) in leader.bus.writes if name == "Operating_Mode"]
+    assert mode_writes == ["elbow_flex"]
+    assert leader.bus.enabled[-1] == ["elbow_flex"]
+    leader.bus.writes.clear()
+
+    leader._update_assistance(
+        {f"{name}.pos": 0.0 for name in leader.config.motors if name != "gripper"}
+    )
+
+    goal_writes = [entry for entry in leader.bus.writes if entry[0] == "Goal_Current"]
+    assert len(goal_writes) == 1
+    assert set(goal_writes[0][2]) == {"elbow_flex"}
+
+
+def test_assist_joint_subset_is_validated():
+    with pytest.raises(ValueError, match="unknown joints"):
+        YAMLeaderConfig(gravity_assist_joints=("elbow_flex", "nope"))
+    with pytest.raises(ValueError, match="non-empty"):
+        YAMLeaderConfig(gravity_assist_joints=())
+
+
 def test_tripped_bus_watchdog_is_rearmed_and_gripper_spring_restored():
     leader = _bare_leader(
         YAMLeaderConfig(

@@ -80,6 +80,10 @@ class YAMLeaderConfig:
     gravity_assist: bool = False
     gravity_assist_gain: float = 0.15
     gravity_assist_current_limit_ma: int = 250
+    # Which arm joints receive assist current. Subsetting lets one joint be
+    # bench-tested at a time (see gello_gravity_hold); unlisted joints stay
+    # passive exactly as when assist is off.
+    gravity_assist_joints: tuple[str, ...] = ARM_JOINT_NAMES
     gravity_assist_damping_nm_per_rad_s: float = 0.003
     gravity_joint_ranges_rad: tuple[tuple[float, float], ...] = DEFAULT_YAM_JOINT_RANGES_RAD
     # Motor direction relative to the active-GELLO URDF. These are the FACTR
@@ -161,6 +165,12 @@ class YAMLeaderConfig:
             raise ValueError("gravity_link_masses_kg values must be finite and >= 0")
         if not 0.0 <= self.follower_limit_buffer_rad < 0.5:
             raise ValueError("follower_limit_buffer_rad must be in [0, 0.5)")
+        joints = tuple(self.gravity_assist_joints)
+        if not joints or len(set(joints)) != len(joints):
+            raise ValueError("gravity_assist_joints must be a non-empty set of joints")
+        unknown = [name for name in joints if name not in ARM_JOINT_NAMES]
+        if unknown:
+            raise ValueError(f"gravity_assist_joints has unknown joints: {unknown}")
         if not 35 <= self.assist_temperature_limit_c <= 60:
             raise ValueError("assist_temperature_limit_c must be in [35, 60]")
         if not 100 <= self.assist_bus_watchdog_ms <= 1000:

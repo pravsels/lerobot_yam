@@ -332,11 +332,13 @@ class YAMLeader(Teleoperator):
         if not self.calibration:
             raise RuntimeError("GELLO assistance requires a leader calibration")
 
-        arm_motors = list(ARM_JOINT_NAMES)
+        arm_motors = [
+            name for name in ARM_JOINT_NAMES if name in self.config.gravity_assist_joints
+        ]
         live_gravity = (
             self.config.gravity_assist and not self.config.gravity_assist_dry_run
         )
-        assisted_motors = arm_motors if live_gravity else []
+        assisted_motors = list(arm_motors) if live_gravity else []
         if self.config.gripper_return:
             assisted_motors.append("gripper")
 
@@ -450,9 +452,14 @@ class YAMLeader(Teleoperator):
                 [float(action[f"{name}.pos"]) for name in ARM_JOINT_NAMES],
                 dtype=np.float64,
             )
+            enabled = [
+                name
+                for name in ARM_JOINT_NAMES
+                if name in self.config.gravity_assist_joints
+            ]
             if not np.all(np.isfinite(normalized)):
                 if not dry_run:
-                    self._write_arm_currents({name: 0 for name in ARM_JOINT_NAMES})
+                    self._write_arm_currents({name: 0 for name in enabled})
                 self._last_assist_q = None
                 self._last_assist_time = None
                 self._assist_velocity[:] = 0.0
@@ -498,6 +505,8 @@ class YAMLeader(Teleoperator):
             )
             currents: dict[str, int] = {}
             for index, name in enumerate(ARM_JOINT_NAMES):
+                if name not in enabled:
+                    continue
                 motor_torque = float(torque_urdf[index]) * int(
                     self.config.gravity_joint_signs[index]
                 )
@@ -514,7 +523,7 @@ class YAMLeader(Teleoperator):
                         self.config.port,
                         [round(float(v), 3) for v in q],
                         [round(float(v), 4) for v in torque_urdf],
-                        [currents[name] for name in ARM_JOINT_NAMES],
+                        {name: currents[name] for name in enabled},
                     )
                 return
             self._write_arm_currents(currents)
