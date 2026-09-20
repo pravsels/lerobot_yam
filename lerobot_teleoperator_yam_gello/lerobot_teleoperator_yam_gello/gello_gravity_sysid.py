@@ -425,27 +425,34 @@ class SysidSession:
                 print()
                 return
 
-    def _contact_suspects(self) -> list[str]:
+    def _contact_suspects(self) -> tuple[set[int], list[str]]:
         """Holds spanning a very wide current range at ~the same angle suggest the
-        arm was resting on something (table): friction alone rarely exceeds this."""
-        suspects = []
+        arm was resting on something (table): friction alone rarely exceeds this.
+
+        Suspect poses are excluded from the fit: a single contaminated pose can
+        drag the phase/intercept far enough to produce a confident-looking but
+        wrong offset suggestion.
+        """
+        suspect_poses: set[int] = set()
+        messages: list[str] = []
         for record in self.records:
             holds = [p for p in record.probes if p.motion == 0]
             for i, first in enumerate(holds):
                 for second in holds[i + 1:]:
                     same_angle = abs(first.theta_urdf - second.theta_urdf) < 0.02
                     if same_angle and abs(first.current_ma - second.current_ma) > 140:
-                        suspects.append(
+                        suspect_poses.add(record.pose_index)
+                        messages.append(
                             f"pose {record.pose_index}: holds at both "
                             f"{first.current_ma:+d} and {second.current_ma:+d} mA at "
                             f"theta {first.theta_urdf:+.3f} — external support (table?) "
-                            "or extreme stiction; treat this pose as suspect"
+                            "or extreme stiction; excluded from the fit"
                         )
                         break
                 else:
                     continue
                 break
-        return suspects
+        return suspect_poses, messages
 
     def report(self) -> dict:
         payload: dict = {
@@ -477,24 +484,32 @@ class SysidSession:
                 f"  pose {event.pose_index} {kind}: theta={event.theta_urdf:+.3f} rad  "
                 f"I={event.current_ma:+.0f} mA  model {event.model_balance_ma:+.0f} mA"
             )
-        contact = self._contact_suspects()
+        suspect_poses, contact = self._contact_suspects()
         payload["contact_suspects"] = contact
         for suspect in contact:
             print(f"WARNING: {suspect}")
 
-        directions = [e.direction for e in self.edge_events]
-        if len(self.edge_events) < 4 or not (
+        clean_events = [
+            e for e in self.edge_events if e.pose_index not in suspect_poses
+        ]
+        if len(clean_events) < len(self.edge_events):
+            print(
+                f"fitting {len(clean_events)} of {len(self.edge_events)} edge "
+                "events (contact-suspect poses excluded)"
+            )
+        directions = [e.direction for e in clean_events]
+        if len(clean_events) < 4 or not (
             any(d > 0 for d in directions) and any(d < 0 for d in directions)
         ):
             print(
-                "\nNot enough edge events for a fit (need >= 4 with both "
+                "\nNot enough clean edge events for a fit (need >= 4 with both "
                 "directions). Collect more poses."
             )
             return payload
 
-        theta = [e.theta_urdf for e in self.edge_events]
-        edge_fit = fit_edge_events(theta, [e.current_ma for e in self.edge_events], directions)
-        model_fit = fit_sine(theta, [e.model_balance_ma for e in self.edge_events])
+        theta = [e.theta_urdf for e in clean_events]
+        edge_fit = fit_edge_events(theta, [e.current_ma for e in clean_events], directions)
+        model_fit = fit_sine(theta, [e.model_balance_ma for e in clean_events])
         corrections = suggest_corrections(edge_fit.sine, model_fit)
         payload["measured_fit"] = asdict(edge_fit.sine)
         payload["measured_friction_ma"] = edge_fit.friction_ma
