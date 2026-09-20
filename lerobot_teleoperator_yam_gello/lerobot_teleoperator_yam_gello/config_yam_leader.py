@@ -10,6 +10,27 @@ from dataclasses import dataclass, field
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+ARM_JOINT_NAMES = (
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "wrist_yaw",
+)
+
+# The LeRobot calibration maps each GELLO joint to the matching YAM follower's
+# normalized range. These physical ranges turn that normalized value back into
+# the generalized coordinates used by the GELLO dynamics model.
+DEFAULT_YAM_JOINT_RANGES_RAD = (
+    (-2.767, 3.28),
+    (-0.15, 3.8),
+    (-0.15, 3.28),
+    (-1.72, 1.72),
+    (-1.72, 1.72),
+    (-2.24, 2.24),
+)
+
 
 @dataclass
 class YAMLeaderConfig:
@@ -42,6 +63,28 @@ class YAMLeaderConfig:
     # Tolerance band (in normalized units) to avoid flicker right at the boundary.
     out_of_range_tolerance: float = 1.0
 
+    # Active assistance is deliberately opt-in. The passive GELLO uses XL330s,
+    # which are substantially weaker than the XC/XM servos in FACTR's active
+    # GELLO. Defaults therefore provide partial support, not hands-off holding.
+    gravity_assist: bool = False
+    gravity_assist_gain: float = 0.15
+    gravity_assist_current_limit_ma: int = 250
+    gravity_assist_damping_nm_per_rad_s: float = 0.003
+    gravity_joint_ranges_rad: tuple[tuple[float, float], ...] = DEFAULT_YAM_JOINT_RANGES_RAD
+    # Motor direction relative to the active-GELLO URDF. These are the FACTR
+    # YAM defaults; override them if a GELLO was assembled with a reversed horn.
+    gravity_joint_signs: tuple[int, ...] = (1, -1, -1, -1, 1, 1)
+
+    # A current-limited position spring holds the squeeze trigger open while
+    # remaining easy to press and hold. This can be used without arm gravity
+    # assistance.
+    gripper_return: bool = False
+    gripper_return_current_ma: int = 100
+
+    # XL330 operating maximum is 70 C. Latch assistance off well below it.
+    assist_temperature_limit_c: int = 50
+    assist_bus_watchdog_ms: int = 200
+
     # Motor configuration
     # XL330-M288 for most joints, XL330-M077 for gripper (different gear ratio)
     motors: dict[str, Motor] = field(default_factory=lambda: {
@@ -53,6 +96,28 @@ class YAMLeaderConfig:
         "wrist_yaw": Motor(6, "xl330-m288", MotorNormMode.RANGE_M100_100),
         "gripper": Motor(7, "xl330-m077", MotorNormMode.RANGE_0_100),
     })
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.gravity_assist_gain <= 1.0:
+            raise ValueError("gravity_assist_gain must be in [0, 1]")
+        if not 1 <= self.gravity_assist_current_limit_ma <= 500:
+            raise ValueError("gravity_assist_current_limit_ma must be in [1, 500]")
+        if not 1 <= self.gripper_return_current_ma <= 300:
+            raise ValueError("gripper_return_current_ma must be in [1, 300]")
+        if self.gravity_assist_damping_nm_per_rad_s < 0:
+            raise ValueError("gravity_assist_damping_nm_per_rad_s must be >= 0")
+        if len(self.gravity_joint_ranges_rad) != len(ARM_JOINT_NAMES):
+            raise ValueError("gravity_joint_ranges_rad must contain six [low, high] pairs")
+        if any(float(low) >= float(high) for low, high in self.gravity_joint_ranges_rad):
+            raise ValueError("gravity_joint_ranges_rad pairs must be ordered low < high")
+        if len(self.gravity_joint_signs) != len(ARM_JOINT_NAMES):
+            raise ValueError("gravity_joint_signs must contain six values")
+        if any(int(sign) not in {-1, 1} for sign in self.gravity_joint_signs):
+            raise ValueError("gravity_joint_signs values must be -1 or 1")
+        if not 35 <= self.assist_temperature_limit_c <= 60:
+            raise ValueError("assist_temperature_limit_c must be in [35, 60]")
+        if not 100 <= self.assist_bus_watchdog_ms <= 1000:
+            raise ValueError("assist_bus_watchdog_ms must be in [100, 1000]")
 
 
 @TeleoperatorConfig.register_subclass("yam_leader")

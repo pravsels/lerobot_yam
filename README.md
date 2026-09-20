@@ -32,6 +32,47 @@ uv run lerobot-teleoperate \
 `--teleop.id` is required when loading an existing calibration file, because
 LeRobot resolves calibration as `<teleop.calibration_dir>/<teleop.id>.json`.
 
+## Optional passive-GELLO assistance
+
+The YAM leader can apply conservative current-limited assistance to passive
+XL330 GELLOs:
+
+```bash
+uv run lerobot-teleoperate \
+  --robot.type=yam_follower \
+  --robot.port=can0 \
+  --teleop.type=yam_leader \
+  --teleop.port=/dev/ttyUSB0 \
+  --teleop.id=yam_gello_left \
+  --teleop.gravity_assist=true \
+  --teleop.gravity_assist_gain=0.10 \
+  --teleop.gravity_assist_current_limit_ma=200 \
+  --teleop.gripper_return=true \
+  --teleop.gripper_return_current_ma=80
+```
+
+Both features are off by default. Gravity torque comes from the active-YAM
+GELLO URDF used by
+[gello_software/FACTR](https://github.com/wuphilipp/gello_software/tree/main/gello/factr),
+but the passive GELLO has weaker XL330s and somewhat different mass. Start at
+gain `0.05`–`0.10`; it should reduce sag, not hold the arm hands-free.
+
+Safety measures:
+
+- per-motor current is hard-clipped (default `250 mA`, configurable up to
+  `500 mA`);
+- the squeeze trigger uses current-based position mode and returns to the
+  calibration's `0`/open endpoint (default `100 mA`);
+- a 200 ms DYNAMIXEL bus watchdog stops output if updates cease;
+- assistance latches off on a motor hardware error, a control exception, or
+  temperature reaching 50 °C;
+- disconnect writes zero current and disables torque.
+
+FACTR's YAM motor directions are the defaults:
+`[1, -1, -1, -1, 1, 1]`. If any joint assists gravity in the wrong direction,
+stop immediately and override `gravity_joint_signs` before retrying. Never
+raise gain to compensate for a wrong sign.
+
 Note: this repo expects `lerobot` 0.4.3 features (plugin discovery in the
 standard CLIs). If 0.4.3 is not on PyPI, install it from
 [source](https://github.com/huggingface/lerobot) instead.
