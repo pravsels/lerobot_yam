@@ -24,6 +24,7 @@ from .gravity_assist import (
     gello_joint_positions,
     torque_to_current_ma,
 )
+from .gravity_profiles import gravity_profile_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -347,11 +348,14 @@ class YAMLeader(Teleoperator):
 
         if self.config.gravity_assist:
             self._gravity_model = GelloGravityModel(
+                urdf_path=gravity_profile_model_path(self.config.gravity_profile),
                 gravity_z_sign=self.config.gravity_urdf_z_sign,
                 link_masses_kg=self.config.gravity_link_masses_kg or None,
             )
             logger.info(
-                "GELLO gravity model link masses (kg): %s",
+                "GELLO gravity profile=%s model=%s link masses (kg): %s",
+                self.config.gravity_profile,
+                self._gravity_model.urdf_path,
                 {k: round(v, 4) for k, v in self._gravity_model.link_masses.items()},
             )
         if self.config.gravity_assist and not live_gravity:

@@ -72,6 +72,7 @@ def main(argv: list[str] | None = None) -> int:
         id=args.id,
         calibration_dir=args.calibration_dir,
         preflight_range_check=False,
+        gravity_assist=False,
         gripper_return=True,
         gripper_return_current_ma=args.current_ma,
     )

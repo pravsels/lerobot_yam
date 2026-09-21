@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from lerobot.motors import Motor, MotorNormMode
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+from .gravity_profiles import DEFAULT_GRAVITY_PROFILE, get_gravity_assist_profile
+
 ARM_JOINT_NAMES = (
     "shoulder_pan",
     "shoulder_lift",
@@ -72,39 +74,39 @@ class YAMLeaderConfig:
     # each end of travel (felt worst at the elbow's rest pose, which sits at
     # the true limit). Padding the normalization window by this buffer makes
     # leader stops map to the true limits instead. Set 0 to disable.
-    follower_limit_buffer_rad: float = 0.15
+    gravity_profile: str = DEFAULT_GRAVITY_PROFILE
+    follower_limit_buffer_rad: float | None = None
 
-    # Active assistance is deliberately opt-in. The passive GELLO uses XL330s,
-    # which are substantially weaker than the XC/XM servos in FACTR's active
-    # GELLO. Defaults therefore provide partial support, not hands-off holding.
-    gravity_assist: bool = False
-    gravity_assist_gain: float = 0.15
-    gravity_assist_current_limit_ma: int = 250
+    # None means "inherit from gravity_profile". Every field remains
+    # individually overridable for bring-up and newly built GELLO variants.
+    gravity_assist: bool | None = None
+    gravity_assist_gain: float | None = None
+    gravity_assist_current_limit_ma: int | None = None
     # Which arm joints receive assist current. Subsetting lets one joint be
     # bench-tested at a time (see gello_gravity_hold); unlisted joints stay
     # passive exactly as when assist is off.
-    gravity_assist_joints: tuple[str, ...] = ARM_JOINT_NAMES
-    gravity_assist_damping_nm_per_rad_s: float = 0.003
-    gravity_joint_ranges_rad: tuple[tuple[float, float], ...] = DEFAULT_YAM_JOINT_RANGES_RAD
+    gravity_assist_joints: tuple[str, ...] | None = None
+    gravity_assist_damping_nm_per_rad_s: float | None = None
+    gravity_joint_ranges_rad: tuple[tuple[float, float], ...] | None = None
     # Motor direction relative to the active-GELLO URDF. These are the FACTR
     # YAM defaults; override them if a GELLO was assembled with a reversed horn.
-    gravity_joint_signs: tuple[int, ...] = (1, -1, -1, -1, 1, 1)
+    gravity_joint_signs: tuple[int, ...] | None = None
     # Radians added per joint after the sign flip: q_urdf = sign * q_yam + offset.
     # Zero assumes the GELLO's URDF home coincides with the YAM zero pose
     # (the default build pose). Tune with gravity_assist_dry_run if a joint's
     # modeled torque is wrong at a known pose; offsets are usually 0 or ±pi/2.
-    gravity_joint_offsets_rad: tuple[float, ...] = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    gravity_joint_offsets_rad: tuple[float, ...] | None = None
     # Which way the URDF's +z axis points physically when the GELLO is
     # mounted: +1 up, -1 down. The bundled yam_active_gello export is z-down
     # (-1) for the standard tabletop mount; with the wrong value every assist
     # torque is inverted and the arm is pushed toward its fallen pose.
-    gravity_urdf_z_sign: int = -1
+    gravity_urdf_z_sign: int | None = None
     # Optional per-link mass override (kg), base to tip: link_base, link_1 …
     # link_6 (7 values). Gravity torque is linear in these masses, so this is
     # the sysid knob for leaders built differently from the bundled URDF
     # (e.g. TRLC-DK1): weigh the printed links, or tune from dry-run logs.
     # Empty tuple keeps the URDF masses.
-    gravity_link_masses_kg: tuple[float, ...] = ()
+    gravity_link_masses_kg: tuple[float, ...] | None = None
     # Compute and log assist currents without configuring motors or applying
     # any torque. Use this first on new hardware to verify signs/offsets.
     gravity_assist_dry_run: bool = False
@@ -112,8 +114,8 @@ class YAMLeaderConfig:
     # A current-limited position spring holds the squeeze trigger open while
     # remaining easy to press and hold. This can be used without arm gravity
     # assistance.
-    gripper_return: bool = False
-    gripper_return_current_ma: int = 100
+    gripper_return: bool | None = None
+    gripper_return_current_ma: int | None = None
 
     # XL330 operating maximum is 70 C. Latch assistance off well below it.
     assist_temperature_limit_c: int = 50
@@ -132,6 +134,42 @@ class YAMLeaderConfig:
     })
 
     def __post_init__(self) -> None:
+        profile = get_gravity_assist_profile(self.gravity_profile)
+        inherited = {
+            "follower_limit_buffer_rad": profile.follower_limit_buffer_rad,
+            "gravity_assist": profile.gravity_assist,
+            "gravity_assist_gain": profile.gravity_assist_gain,
+            "gravity_assist_current_limit_ma": profile.gravity_assist_current_limit_ma,
+            "gravity_assist_joints": profile.gravity_assist_joints,
+            "gravity_assist_damping_nm_per_rad_s": (
+                profile.gravity_assist_damping_nm_per_rad_s
+            ),
+            "gravity_joint_ranges_rad": profile.gravity_joint_ranges_rad,
+            "gravity_joint_signs": profile.gravity_joint_signs,
+            "gravity_joint_offsets_rad": profile.gravity_joint_offsets_rad,
+            "gravity_urdf_z_sign": profile.gravity_urdf_z_sign,
+            "gravity_link_masses_kg": profile.gravity_link_masses_kg,
+            "gripper_return": profile.gripper_return,
+            "gripper_return_current_ma": profile.gripper_return_current_ma,
+        }
+        for name, value in inherited.items():
+            if getattr(self, name) is None:
+                setattr(self, name, value)
+
+        # Profile resolution above guarantees these are concrete. The asserts
+        # also make that invariant visible to type checkers.
+        assert self.gravity_assist_gain is not None
+        assert self.gravity_assist_current_limit_ma is not None
+        assert self.gripper_return_current_ma is not None
+        assert self.gravity_assist_damping_nm_per_rad_s is not None
+        assert self.gravity_joint_ranges_rad is not None
+        assert self.gravity_joint_signs is not None
+        assert self.gravity_joint_offsets_rad is not None
+        assert self.gravity_urdf_z_sign is not None
+        assert self.gravity_link_masses_kg is not None
+        assert self.follower_limit_buffer_rad is not None
+        assert self.gravity_assist_joints is not None
+
         if not 0.0 <= self.gravity_assist_gain <= 1.0:
             raise ValueError("gravity_assist_gain must be in [0, 1]")
         if not 1 <= self.gravity_assist_current_limit_ma <= 500:

@@ -569,6 +569,10 @@ def main(argv: list[str] | None = None) -> int:
         id=args.id,
         calibration_dir=args.calibration_dir,
         preflight_range_check=False,
+        # Sysid owns motor modes/currents itself. Never start production
+        # assistance just because the default hardware profile enables it.
+        gravity_assist=False,
+        gripper_return=False,
         gravity_joint_signs=args.signs,
         gravity_joint_offsets_rad=args.offsets,
         gravity_link_masses_kg=args.masses,

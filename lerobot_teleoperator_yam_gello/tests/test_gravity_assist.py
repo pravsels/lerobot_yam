@@ -3,6 +3,7 @@ import pytest
 from lerobot.motors import MotorCalibration
 
 from lerobot_teleoperator_yam_gello.config_yam_leader import (
+    ARM_JOINT_NAMES,
     DEFAULT_YAM_JOINT_RANGES_RAD,
     YAMLeaderConfig,
 )
@@ -12,6 +13,11 @@ from lerobot_teleoperator_yam_gello.gravity_assist import (
     gello_joint_positions,
     normalized_to_joint_positions,
     torque_to_current_ma,
+)
+from lerobot_teleoperator_yam_gello.gravity_profiles import (
+    DEFAULT_GRAVITY_PROFILE,
+    TRLC_DK1_V1,
+    gravity_profile_model_path,
 )
 from lerobot_teleoperator_yam_gello.yam_leader import YAMLeader
 
@@ -207,13 +213,45 @@ def test_xl330_current_conversion_is_hard_clipped():
         torque_to_current_ma(0.1, "unknown", 250)
 
 
-def test_assistance_is_opt_in_and_limits_are_conservative():
+def test_default_profile_is_identified_trlc_dk1_configuration():
     config = YAMLeaderConfig()
 
-    assert config.gravity_assist is False
-    assert config.gripper_return is False
-    assert config.gravity_assist_current_limit_ma <= 250
-    assert config.gripper_return_current_ma <= 100
+    assert config.gravity_profile == DEFAULT_GRAVITY_PROFILE == "trlc_dk1_v1"
+    assert config.gravity_assist is True
+    assert config.gravity_assist_gain == pytest.approx(0.8)
+    assert config.gravity_joint_signs == (1, 1, -1, -1, 1, 1)
+    assert config.gravity_joint_ranges_rad == TRLC_DK1_V1.gravity_joint_ranges_rad
+    assert config.gravity_joint_offsets_rad == (
+        0.0, -2.61, -0.973, 0.07, 0.0, 0.0,
+    )
+    assert config.gravity_link_masses_kg == (
+        0.142, 0.012, 0.016, 0.008, 0.005, 0.003, 0.013,
+    )
+    assert config.gravity_assist_joints == (
+        "shoulder_lift", "elbow_flex", "wrist_flex",
+    )
+    assert config.gripper_return is True
+    assert config.gripper_return_current_ma == 80
+    assert gravity_profile_model_path(config.gravity_profile).is_file()
+
+
+def test_profile_can_be_disabled_or_overridden_per_gello():
+    passive = YAMLeaderConfig(gravity_profile="passive")
+    assert passive.gravity_assist is False
+    assert passive.gripper_return is False
+
+    custom = YAMLeaderConfig(
+        gravity_assist_gain=0.4,
+        gravity_joint_offsets_rad=(0.0,) * 6,
+        gripper_return_current_ma=60,
+    )
+    assert custom.gravity_assist is True  # inherited
+    assert custom.gravity_assist_gain == pytest.approx(0.4)
+    assert custom.gravity_joint_offsets_rad == (0.0,) * 6
+    assert custom.gripper_return_current_ma == 60
+
+    with pytest.raises(ValueError, match="unknown gravity_profile"):
+        YAMLeaderConfig(gravity_profile="unknown")
     with pytest.raises(ValueError, match="gravity_assist_current_limit_ma"):
         YAMLeaderConfig(gravity_assist_current_limit_ma=501)
 
@@ -262,6 +300,7 @@ def test_enable_assistance_uses_current_modes_limits_watchdog_and_open_target():
         YAMLeaderConfig(
             gravity_assist=True,
             gripper_return=True,
+            gravity_assist_joints=ARM_JOINT_NAMES,
             gravity_assist_current_limit_ma=200,
             gripper_return_current_ma=80,
         )
@@ -303,7 +342,11 @@ def test_goal_registers_are_written_after_torque_enable():
     silently replaced by wherever the trigger rests — a spring that held the
     right leader's trigger closed whenever it was parked closed at connect."""
     leader = _bare_leader(
-        YAMLeaderConfig(gravity_assist=True, gripper_return=True)
+        YAMLeaderConfig(
+            gravity_assist=True,
+            gravity_assist_joints=ARM_JOINT_NAMES,
+            gripper_return=True,
+        )
     )
 
     leader._enable_assistance()
@@ -333,7 +376,11 @@ def test_goal_registers_are_written_after_torque_enable():
 
 def test_dry_run_configures_no_arm_motors_and_writes_no_currents():
     leader = _bare_leader(
-        YAMLeaderConfig(gravity_assist=True, gravity_assist_dry_run=True)
+        YAMLeaderConfig(
+            gravity_assist=True,
+            gravity_assist_dry_run=True,
+            gripper_return=False,
+        )
     )
 
     leader._enable_assistance()
@@ -355,7 +402,12 @@ def test_dry_run_configures_no_arm_motors_and_writes_no_currents():
 
 def test_live_assist_writes_signed_currents_from_urdf_torque():
     leader = _bare_leader(
-        YAMLeaderConfig(gravity_assist=True, gravity_assist_gain=0.10)
+        YAMLeaderConfig(
+            gravity_assist=True,
+            gravity_assist_gain=0.10,
+            gravity_assist_joints=ARM_JOINT_NAMES,
+            gripper_return=False,
+        )
     )
     leader._enable_assistance()
     leader.bus.writes.clear()
@@ -383,7 +435,11 @@ def test_live_assist_writes_signed_currents_from_urdf_torque():
 
 def test_single_joint_assist_configures_and_drives_only_that_joint():
     leader = _bare_leader(
-        YAMLeaderConfig(gravity_assist=True, gravity_assist_joints=("elbow_flex",))
+        YAMLeaderConfig(
+            gravity_assist=True,
+            gravity_assist_joints=("elbow_flex",),
+            gripper_return=False,
+        )
     )
 
     leader._enable_assistance()
@@ -414,6 +470,7 @@ def test_tripped_bus_watchdog_is_rearmed_and_gripper_spring_restored():
         YAMLeaderConfig(
             gravity_assist=True,
             gripper_return=True,
+            gravity_assist_joints=ARM_JOINT_NAMES,
             gripper_return_current_ma=80,
         )
     )
