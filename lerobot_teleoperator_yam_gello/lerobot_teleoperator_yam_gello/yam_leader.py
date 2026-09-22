@@ -11,13 +11,20 @@ import sys
 import time
 from dataclasses import replace
 
+import numpy as np
 from lerobot.motors import MotorCalibration, MotorNormMode
 from lerobot.motors.dynamixel import DynamixelMotorsBus, OperatingMode
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
 
 from lerobot.teleoperators.teleoperator import Teleoperator
 
-from .config_yam_leader import YAMLeaderTeleopConfig
+from .config_yam_leader import ARM_JOINT_NAMES, YAMLeaderTeleopConfig
+from .gravity_assist import (
+    GelloGravityModel,
+    gello_joint_positions,
+    torque_to_current_ma,
+)
+from .gravity_profiles import gravity_profile_model_path
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +66,15 @@ class YAMLeader(Teleoperator):
         # Range-safety state (Phase 2A)
         self._out_of_range_joints: set[str] = set()
         self._last_warn_time: dict[str, float] = {}
+        self._gravity_model: GelloGravityModel | None = None
+        self._assist_enabled = False
+        self._assist_faulted = False
+        self._last_assist_q: np.ndarray | None = None
+        self._last_assist_time: float | None = None
+        self._assist_velocity = np.zeros(len(ARM_JOINT_NAMES), dtype=np.float64)
+        self._live_assist_motors: list[str] = []
+        self._last_health_check_time = 0.0
+        self._last_dry_run_log_time = 0.0
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -92,20 +108,27 @@ class YAMLeader(Teleoperator):
         self._bind_detected_xl330_models()
         self.bus._handshake()
 
-        # Position mode before any Present_Position read. Current/extended
-        # position reports signed multi-turn ticks (-1, 7227, …); calibration
-        # and preflight need the 0–4095 joint circle.
-        self.configure()
+        try:
+            # Position mode before any Present_Position read. Current/extended
+            # position reports signed multi-turn ticks (-1, 7227, …); calibration
+            # and preflight need the 0–4095 joint circle.
+            self.configure()
 
-        if not self.is_calibrated and calibrate:
-            logger.info("Teleoperator not calibrated. Starting calibration...")
-            self.calibrate()
-        else:
-            # Cache calibration state without probing hardware every call
-            self._is_calibrated_cached = bool(self.calibration)
+            if not self.is_calibrated and calibrate:
+                logger.info("Teleoperator not calibrated. Starting calibration...")
+                self.calibrate()
+            else:
+                # Cache calibration state without probing hardware every call
+                self._is_calibrated_cached = bool(self.calibration)
 
-        if self.config.preflight_range_check and self.calibration:
-            self._preflight_range_check()
+            if self.config.preflight_range_check and self.calibration:
+                self._preflight_range_check()
+            if self.config.gravity_assist or self.config.gripper_return:
+                self._enable_assistance()
+        except Exception:
+            self._safe_disable_assistance()
+            self.bus.disconnect()
+            raise
 
         logger.info(f"{self} connected.")
 
@@ -297,22 +320,393 @@ class YAMLeader(Teleoperator):
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action in {dt_ms:.1f}ms")
 
+        if self._assist_enabled and not self._assist_faulted:
+            self._update_assistance(action)
+
         return action
+
+    # =========================================================================
+    # Opt-in gravity and gripper assistance
+    # =========================================================================
+
+    def _enable_assistance(self) -> None:
+        if not self.calibration:
+            raise RuntimeError("GELLO assistance requires a leader calibration")
+
+        arm_motors = [
+            name for name in ARM_JOINT_NAMES if name in self.config.gravity_assist_joints
+        ]
+        live_gravity = (
+            self.config.gravity_assist and not self.config.gravity_assist_dry_run
+        )
+        assisted_motors = list(arm_motors) if live_gravity else []
+        if self.config.gripper_return:
+            assisted_motors.append("gripper")
+
+        self.bus.disable_torque(assisted_motors)
+        watchdog_raw = self._watchdog_raw()
+
+        if self.config.gravity_assist:
+            self._gravity_model = GelloGravityModel(
+                urdf_path=gravity_profile_model_path(self.config.gravity_profile),
+                gravity_z_sign=self.config.gravity_urdf_z_sign,
+                link_masses_kg=self.config.gravity_link_masses_kg or None,
+            )
+            logger.info(
+                "GELLO gravity profile=%s model=%s link masses (kg): %s",
+                self.config.gravity_profile,
+                self._gravity_model.urdf_path,
+                {k: round(v, 4) for k, v in self._gravity_model.link_masses.items()},
+            )
+        if self.config.gravity_assist and not live_gravity:
+            logger.warning(
+                "GELLO gravity assist DRY RUN on %s: computing and logging "
+                "currents, applying no torque to the arm joints",
+                self.config.port,
+            )
+        if live_gravity:
+            for motor in arm_motors:
+                self._set_current_limit_if_needed(
+                    motor, self.config.gravity_assist_current_limit_ma
+                )
+                self.bus.write("Operating_Mode", motor, OperatingMode.CURRENT.value)
+                self.bus.write("Bus_Watchdog", motor, watchdog_raw)
+
+        if self.config.gripper_return:
+            self._set_current_limit_if_needed(
+                "gripper", self.config.gripper_return_current_ma
+            )
+            self.bus.write(
+                "Operating_Mode", "gripper", OperatingMode.CURRENT_POSITION.value
+            )
+            self.bus.write("Bus_Watchdog", "gripper", watchdog_raw)
+
+        # Goal registers MUST be written after enable_torque: the firmware
+        # resets Goal_Position to Present_Position at torque-on in position
+        # modes, so a goal written earlier is silently replaced by wherever the
+        # trigger happened to rest — a spring that holds the trigger closed if
+        # it was parked closed at connect (observed on the right leader).
+        self.bus.enable_torque(assisted_motors)
+        if live_gravity:
+            for motor in arm_motors:
+                self.bus.write("Goal_Current", motor, 0, normalize=False)
+        if self.config.gripper_return:
+            open_tick = self._gripper_open_tick()
+            self.bus.write(
+                "Goal_Current",
+                "gripper",
+                self.config.gripper_return_current_ma,
+                normalize=False,
+            )
+            self.bus.write("Goal_Position", "gripper", open_tick, normalize=False)
+            applied = int(self.bus.read("Goal_Position", "gripper", normalize=False))
+            if applied != int(open_tick):
+                raise RuntimeError(
+                    f"gripper spring goal readback mismatch: wrote {open_tick}, "
+                    f"motor holds {applied} — goal was reset by the firmware"
+                )
+            calibration = self.calibration["gripper"]
+            logger.warning(
+                "GELLO gripper return target: port=%s open_tick=%d "
+                "calibration=[%d,%d] current_limit=%dmA",
+                self.config.port,
+                open_tick,
+                calibration.range_min,
+                calibration.range_max,
+                self.config.gripper_return_current_ma,
+            )
+        self._live_assist_motors = list(assisted_motors)
+        self._assist_enabled = True
+        self._assist_faulted = False
+        self._last_assist_q = None
+        self._last_assist_time = None
+        self._assist_velocity[:] = 0.0
+        self._last_health_check_time = time.monotonic()
+        logger.warning(
+            "GELLO active assistance enabled on %s: gravity=%s (gain=%.3f, "
+            "limit=%dmA), gripper_return=%s (limit=%dmA), watchdog=%dms",
+            self.config.port,
+            self.config.gravity_assist,
+            self.config.gravity_assist_gain,
+            self.config.gravity_assist_current_limit_ma,
+            self.config.gripper_return,
+            self.config.gripper_return_current_ma,
+            self.config.assist_bus_watchdog_ms,
+        )
+
+    def _watchdog_raw(self) -> int:
+        return max(1, int(math.ceil(self.config.assist_bus_watchdog_ms / 20.0)))
+
+    def _set_current_limit_if_needed(self, motor: str, limit_ma: int) -> None:
+        existing = int(self.bus.read("Current_Limit", motor))
+        if existing != int(limit_ma):
+            # Current_Limit is EEPROM. Avoid spending a write cycle on every
+            # connection once the conservative hardware ceiling is installed.
+            self.bus.write("Current_Limit", motor, int(limit_ma), normalize=False)
+
+    def _gripper_open_tick(self) -> int:
+        calibration = self.calibration["gripper"]
+        # The YAM squeeze trigger's physical open/rest pose is the high-tick
+        # endpoint on a standard build; the operator squeezes toward low ticks
+        # to close. A mirrored build (e.g. the right leader of a bimanual DK1
+        # pair) reverses the tick direction — mark its calibration with
+        # drive_mode=1, which flips both LeRobot's normalization (teleop
+        # squeeze direction) and this spring target consistently.
+        return (
+            int(calibration.range_min)
+            if calibration.drive_mode
+            else int(calibration.range_max)
+        )
+
+    def _update_assistance(self, action: dict[str, float]) -> None:
+        now = time.monotonic()
+        try:
+            if now - self._last_health_check_time >= 1.0:
+                self._check_assist_health()
+                self._last_health_check_time = now
+
+            if not self.config.gravity_assist:
+                return
+            dry_run = self.config.gravity_assist_dry_run
+            normalized = np.asarray(
+                [float(action[f"{name}.pos"]) for name in ARM_JOINT_NAMES],
+                dtype=np.float64,
+            )
+            enabled = [
+                name
+                for name in ARM_JOINT_NAMES
+                if name in self.config.gravity_assist_joints
+            ]
+            if not np.all(np.isfinite(normalized)):
+                if not dry_run:
+                    self._write_arm_currents({name: 0 for name in enabled})
+                self._last_assist_q = None
+                self._last_assist_time = None
+                self._assist_velocity[:] = 0.0
+                return
+
+            # URDF-frame joint coordinates: q_urdf = sign * q_yam + offset.
+            # The torque the model returns is therefore also URDF-frame and
+            # must be mapped back through the same signs for the motors.
+            q = gello_joint_positions(
+                normalized,
+                self.config.gravity_joint_ranges_rad,
+                self.config.gravity_joint_signs,
+                self.config.gravity_joint_offsets_rad,
+            )
+            # Low-passed velocity from well-spaced samples only: with 4096
+            # ticks/rev, one tick of read noise over a sub-millisecond dt
+            # would otherwise command large alternating damping currents.
+            if self._last_assist_q is None or self._last_assist_time is None:
+                self._last_assist_q = q
+                self._last_assist_time = now
+            else:
+                dt = now - self._last_assist_time
+                if dt > 0.25:
+                    self._assist_velocity[:] = 0.0
+                    self._last_assist_q = q
+                    self._last_assist_time = now
+                elif dt >= 0.005:
+                    raw_velocity = np.clip((q - self._last_assist_q) / dt, -5.0, 5.0)
+                    self._assist_velocity = (
+                        0.7 * self._assist_velocity + 0.3 * raw_velocity
+                    )
+                    self._last_assist_q = q
+                    self._last_assist_time = now
+                # dt < 5 ms: keep the previous sample; too noisy to difference.
+
+            if self._gravity_model is None:
+                raise RuntimeError("gravity model was not initialized")
+            torque_urdf = (
+                self.config.gravity_assist_gain
+                * self._gravity_model.gravity_torques(q)
+                - self.config.gravity_assist_damping_nm_per_rad_s
+                * self._assist_velocity
+            )
+            currents: dict[str, int] = {}
+            for index, name in enumerate(ARM_JOINT_NAMES):
+                if name not in enabled:
+                    continue
+                motor_torque = float(torque_urdf[index]) * int(
+                    self.config.gravity_joint_signs[index]
+                )
+                currents[name] = torque_to_current_ma(
+                    motor_torque,
+                    self.bus.motors[name].model,
+                    self.config.gravity_assist_current_limit_ma,
+                )
+            if dry_run:
+                if now - self._last_dry_run_log_time >= 1.0:
+                    self._last_dry_run_log_time = now
+                    logger.info(
+                        "GELLO gravity DRY RUN %s: q_urdf=%s tau_urdf=%s currents_ma=%s",
+                        self.config.port,
+                        [round(float(v), 3) for v in q],
+                        [round(float(v), 4) for v in torque_urdf],
+                        {name: currents[name] for name in enabled},
+                    )
+                return
+            self._write_arm_currents(currents)
+        except Exception as exc:
+            self._latch_assist_fault(exc)
+
+    def _write_arm_currents(self, currents: dict[str, int]) -> None:
+        self.bus.sync_write("Goal_Current", currents, normalize=False)
+
+    def _check_assist_health(self) -> None:
+        motors = list(ARM_JOINT_NAMES)
+        if self.config.gripper_return:
+            motors.append("gripper")
+        temperatures = self.bus.sync_read(
+            "Present_Temperature", motors, normalize=False
+        )
+        hot = {
+            name: int(value)
+            for name, value in temperatures.items()
+            if int(value) >= self.config.assist_temperature_limit_c
+        }
+        if hot:
+            raise RuntimeError(
+                f"GELLO motor temperature reached safety limit "
+                f"{self.config.assist_temperature_limit_c}C: {hot}"
+            )
+        errors = self.bus.sync_read("Hardware_Error_Status", motors, normalize=False)
+        failed = {name: int(value) for name, value in errors.items() if int(value)}
+        if failed:
+            raise RuntimeError(f"GELLO hardware error status: {failed}")
+        self._rearm_tripped_watchdogs()
+
+    def _rearm_tripped_watchdogs(self) -> None:
+        """Recover motors whose bus watchdog fired during a stall.
+
+        Any pause in the teleop loop longer than the watchdog window (a
+        websocket reconnect, a calibration prompt) trips the DYNAMIXEL bus
+        watchdog. A tripped motor stops output and makes its Goal registers
+        read-only, and our fast Goal_Current sync writes do not read status
+        packets — so without this, assistance silently stays dead for the
+        rest of the session.
+        """
+        if not self._live_assist_motors:
+            return
+        statuses = self.bus.sync_read(
+            "Bus_Watchdog", self._live_assist_motors, normalize=False
+        )
+        # A tripped watchdog reads -1, i.e. 255 in the unsigned byte register.
+        tripped = [name for name, value in statuses.items() if int(value) > 127]
+        if not tripped:
+            return
+        logger.warning(
+            "GELLO bus watchdog tripped on %s (loop stalled); re-arming assistance",
+            tripped,
+        )
+        watchdog_raw = self._watchdog_raw()
+        for name in tripped:
+            # Writing 0 clears the error state; then re-arm the window.
+            self.bus.write("Bus_Watchdog", name, 0, normalize=False)
+            self.bus.write("Bus_Watchdog", name, watchdog_raw, normalize=False)
+        if "gripper" in tripped and self.config.gripper_return:
+            # The trip cleared the gripper's goal output; restore the spring.
+            self.bus.write(
+                "Goal_Current",
+                "gripper",
+                self.config.gripper_return_current_ma,
+                normalize=False,
+            )
+            self.bus.write(
+                "Goal_Position", "gripper", self._gripper_open_tick(), normalize=False
+            )
+
+    def _latch_assist_fault(self, exc: Exception) -> None:
+        if self._assist_faulted:
+            return
+        self._assist_faulted = True
+        logger.exception(
+            "GELLO active assistance faulted; disabling torque and continuing "
+            "in passive read-only mode: %s",
+            exc,
+        )
+        self._safe_disable_assistance()
+
+    def _safe_disable_assistance(self) -> None:
+        if not self.is_connected:
+            self._assist_enabled = False
+            return
+        try:
+            if self.config.gravity_assist:
+                self._write_arm_currents({name: 0 for name in ARM_JOINT_NAMES})
+            if self.config.gripper_return:
+                self.bus.write(
+                    "Goal_Current", "gripper", 0, normalize=False, num_retry=1
+                )
+        except Exception:
+            logger.warning("failed to write zero GELLO assistance current", exc_info=True)
+        try:
+            self.bus.disable_torque(num_retry=1)
+        except Exception:
+            logger.warning("failed to disable GELLO torque", exc_info=True)
+        else:
+            try:
+                for motor in self.bus.motors:
+                    self.bus.write("Bus_Watchdog", motor, 0, normalize=False)
+                    self.bus.write(
+                        "Operating_Mode",
+                        motor,
+                        OperatingMode.POSITION.value,
+                        normalize=False,
+                    )
+            except Exception:
+                logger.warning(
+                    "failed to restore passive GELLO motor mode", exc_info=True
+                )
+        self._assist_enabled = False
+        self._live_assist_motors = []
 
     # =========================================================================
     # Range-safety helpers
     # =========================================================================
 
     def _read_raw_ticks(self) -> dict[str, int]:
-        """Read raw Present_Position ticks (no clamping/normalization) with retry."""
+        """Read ticks and choose the 4096-wrap nearest each calibration range.
+
+        XL330 position/current mode transitions can expose the same physical
+        position as e.g. ``-6`` or ``4090``. Calibration is one joint circle,
+        so keeping the nearest equivalent prevents a mode switch from creating
+        a false out-of-range event.
+        """
         last_exc = None
         for _ in range(max(1, self.config.read_retries)):
             try:
-                return self.bus.sync_read("Present_Position", normalize=False)
+                raw = self.bus.sync_read("Present_Position", normalize=False)
+                if not self.calibration:
+                    return {name: int(value) for name, value in raw.items()}
+                return {
+                    name: self._tick_near_calibration(name, int(value))
+                    for name, value in raw.items()
+                }
             except Exception as exc:
                 last_exc = exc
                 time.sleep(self.config.read_retry_sleep_s)
         raise last_exc
+
+    def _tick_near_calibration(self, motor_name: str, ticks: int) -> int:
+        calibration = self.calibration[motor_name]
+        base = ticks % 4096
+        candidates = (base - 4096, base, base + 4096)
+
+        def distance_to_range(value: int) -> int:
+            if value < calibration.range_min:
+                return calibration.range_min - value
+            if value > calibration.range_max:
+                return value - calibration.range_max
+            return 0
+
+        return min(
+            candidates,
+            key=lambda value: (
+                distance_to_range(value),
+                abs(value - (calibration.range_min + calibration.range_max) / 2.0),
+            ),
+        )
 
     def _normalized_tol_to_ticks_default(self) -> int:
         """Average tick tolerance derived from the configured normalized tolerance.
@@ -333,6 +727,29 @@ class YAMLeader(Teleoperator):
         cal = self.calibration[motor_name]
         return (cal.range_min - tol_ticks) <= ticks <= (cal.range_max + tol_ticks)
 
+    def _normalization_window(self, motor_name: str) -> tuple[float, float]:
+        """The tick window normalization maps onto [-100, 100].
+
+        For arm joints this is the swept calibration window padded by the
+        follower's ±0.15 rad joint-limit buffer (converted to ticks). The YAM
+        normalizes over its *buffered* limits, so an unpadded leader endpoint
+        commands an unreachable target and the joint gets a dead zone at each
+        end of travel. Range/preflight checks still use the raw swept window.
+        """
+        cal = self.calibration[motor_name]
+        lo, hi = float(cal.range_min), float(cal.range_max)
+        buffer_rad = float(self.config.follower_limit_buffer_rad)
+        if motor_name not in ARM_JOINT_NAMES or buffer_rad <= 0.0 or hi <= lo:
+            return lo, hi
+        index = ARM_JOINT_NAMES.index(motor_name)
+        range_lo, range_hi = self.config.gravity_joint_ranges_rad[index]
+        true_span_rad = (float(range_hi) - float(range_lo)) - 2.0 * buffer_rad
+        if true_span_rad <= 0.0:
+            return lo, hi
+        ticks_per_rad = (hi - lo) / true_span_rad
+        pad = ticks_per_rad * buffer_rad
+        return lo - pad, hi + pad
+
     def _normalize_ticks(self, motor_name: str, ticks: int) -> float:
         """Replicate lerobot _normalize() formula manually for a single motor.
 
@@ -341,7 +758,7 @@ class YAMLeader(Teleoperator):
         """
         cal = self.calibration[motor_name]
         motor = self.bus.motors[motor_name]
-        lo, hi = cal.range_min, cal.range_max
+        lo, hi = self._normalization_window(motor_name)
         if hi == lo:
             return 0.0
         bounded = min(hi, max(lo, ticks))
@@ -412,6 +829,7 @@ class YAMLeader(Teleoperator):
         """Disconnect from teleoperator hardware."""
         if not self.is_connected:
             return
+        self._safe_disable_assistance()
         self.bus.disconnect()
         logger.info(f"{self} disconnected.")
 
