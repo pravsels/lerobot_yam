@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "yam-common"
-version = "0.2.0"
+version = "0.1.2"
 description = "Hardware controller and shared utilities for YAM arms"
 readme = "README.md"
 authors = [
